@@ -57,7 +57,7 @@ wineforge install-engine engine.tar.gz engine.runtime.json /absolute/engine/dest
 # Normally optional: `run` performs this automatically when the prefix is absent.
 wineforge app create profile.json \
   --engine-manifest engine.runtime.json \
-  --engine-root /absolute/engine/destination/wineforge-engine
+  --engine-root /absolute/engine/destination
 
 # Preview and then delete a managed engine installed beneath a store.
 wineforge engine prune --store /absolute/engine/store --id ENGINE_ID
@@ -78,8 +78,11 @@ wineforge verify profile.json
 # managed app instance automatically. An existing unmanaged prefix is refused.
 wineforge run profile.json \
   --engine-manifest engine.runtime.json \
-  --engine-root /absolute/engine/destination/wineforge-engine
+  --engine-root /absolute/engine/destination
 ```
+
+`--engine-root` accepts either the destination passed to `install-engine` or
+its contained `wineforge-engine` directory.
 
 Pruning only recognizes immediate child directories containing Wineforge's
 management marker; unrelated files and unmarked directories are ignored. Pass
