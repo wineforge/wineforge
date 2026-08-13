@@ -590,9 +590,20 @@ fn validate_engine_selection(
 }
 
 fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
-    let canonical_root = fs::canonicalize(engine_root)
+    let direct_wine = engine_root.join(&engine.wine_binary);
+    let resolved_root = if direct_wine.is_file() {
+        engine_root.to_path_buf()
+    } else {
+        let installed_root = engine_root.join("wineforge-engine");
+        if installed_root.join(&engine.wine_binary).is_file() {
+            installed_root
+        } else {
+            engine_root.to_path_buf()
+        }
+    };
+    let canonical_root = fs::canonicalize(&resolved_root)
         .with_context(|| format!("invalid engine root: {}", engine_root.display()))?;
-    let wine = engine_root.join(&engine.wine_binary);
+    let wine = resolved_root.join(&engine.wine_binary);
     let canonical_wine = fs::canonicalize(&wine)
         .with_context(|| format!("Wine executable does not exist: {}", wine.display()))?;
     if !canonical_wine.starts_with(&canonical_root) || !canonical_wine.is_file() {
@@ -613,6 +624,26 @@ fn add_wine_environment(
     for (key, value) in &profile.environment.0 {
         command.env(key, value);
     }
+}
+
+fn add_winetricks_engine_environment(command: &mut ProcessCommand, wine: &Path) -> Result<()> {
+    let engine_bin = wine
+        .parent()
+        .context("Wine executable must have a parent directory")?;
+    command.env("WINE", wine).env("WINE64", wine);
+    let wineserver = engine_bin.join("wineserver");
+    if wineserver.is_file() {
+        command.env("WINESERVER", wineserver);
+    }
+    let mut paths = vec![engine_bin.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).context("failed to construct Winetricks PATH")?,
+    );
+    Ok(())
 }
 
 fn create_app_instance(
@@ -647,6 +678,7 @@ fn create_app_instance(
     let result = (|| -> Result<()> {
         let mut wineboot = ProcessCommand::new(&wine);
         wineboot.args(["wineboot", "--init"]);
+        wineboot.current_dir(parent);
         add_wine_environment(&mut wineboot, profile, engine);
         let status = wineboot
             .status()
@@ -659,7 +691,8 @@ fn create_app_instance(
         if !profile.winetricks.is_empty() {
             let mut winetricks = ProcessCommand::new(winetricks_command);
             winetricks.arg("-q").args(&profile.winetricks);
-            winetricks.env("WINE", &wine);
+            winetricks.current_dir(profile.prefix.join("drive_c"));
+            add_winetricks_engine_environment(&mut winetricks, &wine)?;
             add_wine_environment(&mut winetricks, profile, engine);
             let status = winetricks.status().with_context(|| {
                 format!(
@@ -804,6 +837,7 @@ fn run_profile(
     let wine = engine_wine(engine, engine_root)?;
     let mut command = ProcessCommand::new(&wine);
     command.arg(&profile.executable).args(&profile.arguments);
+    command.current_dir(profile.prefix.join("drive_c"));
     add_wine_environment(&mut command, profile, engine);
     let status = command
         .status()
@@ -935,6 +969,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::ffi::OsStr;
     use tempfile::tempdir;
     use wineforge_core::{Artifact, ArtifactSource, Environment, License, Sha256Digest};
 
@@ -977,6 +1012,53 @@ mod tests {
                 acceptance_required: false,
             },
         }
+    }
+
+    #[test]
+    fn winetricks_uses_the_selected_engine_tools() {
+        let temp = tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let wine = bin.join("wine");
+        let wineserver = bin.join("wineserver");
+        fs::write(&wine, b"").unwrap();
+        fs::write(&wineserver, b"").unwrap();
+        let mut command = ProcessCommand::new("winetricks");
+
+        add_winetricks_engine_environment(&mut command, &wine).unwrap();
+
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.unwrap().to_owned()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(OsStr::new("WINE")),
+            Some(&wine.into_os_string())
+        );
+        assert_eq!(
+            environment.get(OsStr::new("WINESERVER")),
+            Some(&wineserver.into_os_string())
+        );
+        assert!(
+            std::env::split_paths(environment.get(OsStr::new("PATH")).unwrap())
+                .next()
+                .is_some_and(|path| path == bin)
+        );
+    }
+
+    #[test]
+    fn engine_root_accepts_an_install_destination() {
+        let temp = tempdir().unwrap();
+        let installed_root = temp.path().join("wineforge-engine");
+        fs::create_dir(&installed_root).unwrap();
+        let wine = installed_root.join("bin/wine");
+        fs::create_dir(wine.parent().unwrap()).unwrap();
+        fs::write(&wine, b"").unwrap();
+
+        assert_eq!(
+            engine_wine(&manifest("0".repeat(64)), temp.path()).unwrap(),
+            wine.canonicalize().unwrap()
+        );
     }
 
     #[test]
