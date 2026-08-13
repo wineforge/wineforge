@@ -27,6 +27,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create and manage isolated application instances.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
+    },
     /// Manage locally installed and built engines.
     Engine {
         #[command(subcommand)]
@@ -62,9 +67,26 @@ enum Command {
         engine_manifest: PathBuf,
         #[arg(long)]
         engine_root: PathBuf,
+        /// Winetricks executable used only when an absent instance is created.
+        #[arg(long, default_value = "winetricks")]
+        winetricks_command: PathBuf,
         /// Apply mapping changes before launch. Without this flag, drift fails closed.
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// Create a fresh prefix, sanitize host integration, and install declared Winetricks verbs.
+    Create {
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        #[arg(long, default_value = "winetricks")]
+        winetricks_command: PathBuf,
     },
 }
 
@@ -107,6 +129,7 @@ enum EngineCommand {
 
 const ENGINE_MARKER: &str = ".wineforge-engine.json";
 const BUILD_ARTIFACT_MARKER: &str = ".wineforge-build-artifacts.json";
+const APP_INSTANCE_MARKER: &str = "instance.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +143,19 @@ struct ManagedEntry {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::App { command } => match command {
+            AppCommand::Create {
+                profile,
+                engine_manifest,
+                engine_root,
+                winetricks_command,
+            } => create_app_instance(
+                &read_profile(&profile)?,
+                &read_engine(&engine_manifest)?,
+                &engine_root,
+                &winetricks_command,
+            )?,
+        },
         Command::Engine { command } => match command {
             EngineCommand::Prune {
                 store,
@@ -172,11 +208,13 @@ fn main() -> Result<()> {
             profile,
             engine_manifest,
             engine_root,
+            winetricks_command,
             apply,
         } => run_profile(
             &read_profile(&profile)?,
             &read_engine(&engine_manifest)?,
             &engine_root,
+            &winetricks_command,
             apply,
         )?,
     }
@@ -526,12 +564,10 @@ fn verify_profile(profile: &ApplicationProfile) -> Result<()> {
     Ok(())
 }
 
-fn run_profile(
+fn validate_engine_selection(
     profile: &ApplicationProfile,
     engine: &EngineManifest,
-    engine_root: &Path,
-    apply: bool,
-) -> Result<()> {
+) -> Result<Platform> {
     let platform = current_platform()?;
     if engine.platform != platform {
         bail!("engine platform does not match this host");
@@ -550,17 +586,26 @@ fn run_profile(
     if engine.translation == Translation::Rosetta2 && !rosetta_available() {
         bail!("this x86-64 engine requires Rosetta 2, which was not detected");
     }
-    if apply {
-        apply_profile(profile, true)?;
-    } else {
-        verify_profile(profile).context("launch failed closed because mapping state drifted")?;
-    }
+    Ok(platform)
+}
+
+fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(engine_root)
+        .with_context(|| format!("invalid engine root: {}", engine_root.display()))?;
     let wine = engine_root.join(&engine.wine_binary);
-    if !wine.is_file() {
-        bail!("Wine executable does not exist: {}", wine.display());
+    let canonical_wine = fs::canonicalize(&wine)
+        .with_context(|| format!("Wine executable does not exist: {}", wine.display()))?;
+    if !canonical_wine.starts_with(&canonical_root) || !canonical_wine.is_file() {
+        bail!("declared Wine executable escapes the engine root");
     }
-    let mut command = ProcessCommand::new(&wine);
-    command.arg(&profile.executable).args(&profile.arguments);
+    Ok(canonical_wine)
+}
+
+fn add_wine_environment(
+    command: &mut ProcessCommand,
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+) {
     command.env("WINEPREFIX", &profile.prefix);
     for (key, value) in &engine.environment.0 {
         command.env(key, value);
@@ -568,6 +613,198 @@ fn run_profile(
     for (key, value) in &profile.environment.0 {
         command.env(key, value);
     }
+}
+
+fn create_app_instance(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+    winetricks_command: &Path,
+) -> Result<()> {
+    validate_engine_selection(profile, engine)?;
+    let wine = engine_wine(engine, engine_root)?;
+    if fs::symlink_metadata(&profile.prefix).is_ok() {
+        bail!(
+            "app instance already exists; refusing overwrite: {}",
+            profile.prefix.display()
+        );
+    }
+    let parent = profile
+        .prefix
+        .parent()
+        .context("prefix must have a parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create instance parent: {}", parent.display()))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("invalid prefix parent: {}", parent.display()))?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        bail!(
+            "prefix parent must be a real directory: {}",
+            parent.display()
+        );
+    }
+
+    let result = (|| -> Result<()> {
+        let mut wineboot = ProcessCommand::new(&wine);
+        wineboot.args(["wineboot", "--init"]);
+        add_wine_environment(&mut wineboot, profile, engine);
+        let status = wineboot
+            .status()
+            .context("failed to start Wine prefix initialization")?;
+        if !status.success() {
+            bail!("Wine prefix initialization exited with {status}");
+        }
+        sanitize_prefix(&profile.prefix)?;
+
+        if !profile.winetricks.is_empty() {
+            let mut winetricks = ProcessCommand::new(winetricks_command);
+            winetricks.arg("-q").args(&profile.winetricks);
+            winetricks.env("WINE", &wine);
+            add_wine_environment(&mut winetricks, profile, engine);
+            let status = winetricks.status().with_context(|| {
+                format!(
+                    "failed to start Winetricks executable {}",
+                    winetricks_command.display()
+                )
+            })?;
+            if !status.success() {
+                bail!("Winetricks exited with {status}");
+            }
+            // Winetricks and Wine may recreate host convenience mappings.
+            sanitize_prefix(&profile.prefix)?;
+        }
+
+        apply_profile(profile, true)?;
+        verify_host_exposure(profile)?;
+        write_json(
+            &profile.prefix.join(".wineforge").join(APP_INSTANCE_MARKER),
+            &ManagedEntry {
+                schema_version: 1,
+                kind: "app-instance".into(),
+                id: profile.id.clone(),
+                artifact_sha256: None,
+            },
+        )?;
+        println!("created managed app instance {}", profile.id);
+        Ok(())
+    })();
+
+    if result.is_err()
+        && fs::symlink_metadata(&profile.prefix)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        fs::remove_dir_all(&profile.prefix).with_context(|| {
+            format!(
+                "creation failed and the incomplete prefix could not be removed: {}",
+                profile.prefix.display()
+            )
+        })?;
+    }
+    result
+}
+
+fn sanitize_prefix(prefix: &Path) -> Result<()> {
+    let users = prefix.join("drive_c/users");
+    let inspection = inspect_prefix(prefix)?;
+    for finding in inspection
+        .symlinks
+        .iter()
+        .filter(|item| item.escapes_prefix)
+    {
+        fs::remove_file(&finding.path).with_context(|| {
+            format!(
+                "failed to remove host integration {}",
+                finding.path.display()
+            )
+        })?;
+        if finding.path.starts_with(&users) {
+            fs::create_dir(&finding.path).with_context(|| {
+                format!(
+                    "failed to replace host user-folder link with private directory {}",
+                    finding.path.display()
+                )
+            })?;
+        }
+    }
+    let remaining = inspect_prefix(prefix)?
+        .symlinks
+        .into_iter()
+        .filter(|item| item.escapes_prefix)
+        .map(|item| item.path)
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        bail!("prefix sanitization left host exposure: {remaining:?}");
+    }
+    Ok(())
+}
+
+fn verify_managed_instance(profile: &ApplicationProfile) -> Result<()> {
+    let marker_path = profile.prefix.join(".wineforge").join(APP_INSTANCE_MARKER);
+    let metadata = fs::symlink_metadata(&marker_path).with_context(|| {
+        format!(
+            "prefix is not a managed app instance: {}",
+            marker_path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("unsafe app-instance marker: {}", marker_path.display());
+    }
+    let marker: ManagedEntry = read_json(&marker_path)?;
+    if marker.schema_version != 1 || marker.kind != "app-instance" || marker.id != profile.id {
+        bail!("app-instance marker does not match profile {}", profile.id);
+    }
+    Ok(())
+}
+
+fn verify_host_exposure(profile: &ApplicationProfile) -> Result<()> {
+    let allowed = profile
+        .mappings
+        .iter()
+        .filter_map(|mapping| mapping.normalized_drive())
+        .map(|drive| {
+            profile
+                .prefix
+                .join("dosdevices")
+                .join(format!("{}:", drive.to_ascii_lowercase()))
+        })
+        .collect::<BTreeSet<_>>();
+    let unexpected = inspect_prefix(&profile.prefix)?
+        .symlinks
+        .into_iter()
+        .filter(|item| item.escapes_prefix && !allowed.contains(&item.path))
+        .map(|item| format!("{} -> {}", item.path.display(), item.target.display()))
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        bail!(
+            "launch refused because the prefix exposes undeclared host paths: {}",
+            unexpected.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn run_profile(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+    winetricks_command: &Path,
+    apply: bool,
+) -> Result<()> {
+    validate_engine_selection(profile, engine)?;
+    if fs::symlink_metadata(&profile.prefix).is_err() {
+        create_app_instance(profile, engine, engine_root, winetricks_command)?;
+    }
+    verify_managed_instance(profile)?;
+    if apply {
+        apply_profile(profile, true)?;
+    } else {
+        verify_profile(profile).context("launch failed closed because mapping state drifted")?;
+    }
+    verify_host_exposure(profile)?;
+    let wine = engine_wine(engine, engine_root)?;
+    let mut command = ProcessCommand::new(&wine);
+    command.arg(&profile.executable).args(&profile.arguments);
+    add_wine_environment(&mut command, profile, engine);
     let status = command
         .status()
         .with_context(|| format!("failed to launch {}", wine.display()))?;
@@ -701,6 +938,26 @@ mod tests {
     use tempfile::tempdir;
     use wineforge_core::{Artifact, ArtifactSource, Environment, License, Sha256Digest};
 
+    fn profile(prefix: &Path) -> ApplicationProfile {
+        ApplicationProfile {
+            schema_version: 1,
+            id: "example-app".into(),
+            name: "Example App".into(),
+            prefix: prefix.into(),
+            executable: r"C:\Program Files\Example\example.exe".into(),
+            arguments: Vec::new(),
+            engines: std::collections::BTreeMap::from([(
+                Platform::MacosX86_64,
+                wineforge_core::EngineSelection {
+                    id: "example-engine-macos-x86_64".into(),
+                },
+            )]),
+            environment: Environment::default(),
+            winetricks: Vec::new(),
+            mappings: Vec::new(),
+        }
+    }
+
     fn manifest(digest: String) -> EngineManifest {
         EngineManifest {
             schema_version: 1,
@@ -776,6 +1033,56 @@ mod tests {
             Path::new("wineforge-engine/bin/wine"),
             Path::new("/tmp/outside")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitization_replaces_host_user_links_and_removes_root_drive() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let user = prefix.join("drive_c/users/example");
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir(prefix.join("dosdevices")).unwrap();
+        symlink(temp.path(), user.join("Documents")).unwrap();
+        symlink("/", prefix.join("dosdevices/z:")).unwrap();
+
+        sanitize_prefix(&prefix).unwrap();
+
+        assert!(user.join("Documents").is_dir());
+        assert!(!user.join("Documents").is_symlink());
+        assert!(!prefix.join("dosdevices/z:").exists());
+        assert!(
+            inspect_prefix(&prefix)
+                .unwrap()
+                .symlinks
+                .iter()
+                .all(|finding| !finding.escapes_prefix)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_audit_allows_only_declared_host_mapping() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let allowed = temp.path().join("allowed");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&allowed).unwrap();
+        symlink(&allowed, prefix.join("dosdevices/s:")).unwrap();
+        let mut value = profile(&prefix);
+        value.mappings.push(wineforge_core::HostMapping {
+            drive: "S".into(),
+            host_path: allowed,
+            access: MappingAccess::ReadWrite,
+        });
+        verify_host_exposure(&value).unwrap();
+
+        symlink("/", prefix.join("dosdevices/z:")).unwrap();
+        assert!(verify_host_exposure(&value).is_err());
     }
 
     #[test]

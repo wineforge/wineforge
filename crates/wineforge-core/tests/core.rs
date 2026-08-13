@@ -25,6 +25,7 @@ fn profile(prefix: &Path) -> ApplicationProfile {
             },
         )]),
         environment: Environment(BTreeMap::from([("WINEDEBUG".into(), "-all".into())])),
+        winetricks: vec!["corefonts".into()],
         mappings: vec![HostMapping {
             drive: "W".into(),
             host_path: prefix
@@ -59,6 +60,7 @@ fn profile_validation_rejects_root_reserved_duplicate_and_unsafe_environment() {
         .environment
         .0
         .insert("LD_PRELOAD".into(), "/tmp/module".into());
+    value.winetricks = vec!["vcrun2022".into(), "vcrun2022".into(), "--force".into()];
     value.mappings = vec![
         HostMapping {
             drive: "c".into(),
@@ -78,6 +80,8 @@ fn profile_validation_rejects_root_reserved_duplicate_and_unsafe_environment() {
     assert!(errors.contains("invalid environment"));
     assert!(errors.contains("controlled by the launcher"));
     assert!(errors.contains("must be absolute"));
+    assert!(errors.contains("verb is duplicated"));
+    assert!(errors.contains("not an option or command"));
 }
 
 #[test]
