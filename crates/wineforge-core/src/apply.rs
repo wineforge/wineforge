@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
-use crate::{MappingAccess, MappingAction, MappingPlan};
+use crate::{MappingAction, MappingPlan};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -22,8 +22,6 @@ pub enum ApplyError {
     InvalidPrefix(PathBuf),
     #[error("prefix is locked by another operation: {0}")]
     Locked(PathBuf),
-    #[error("read-only mapping for drive {0} requires a platform isolation backend")]
-    ReadOnlyUnsupported(char),
     #[error("unsafe drive in mapping plan: {0}")]
     UnsafeDrive(char),
     #[error("unsafe host path for drive {drive}: {path} ({reason})")]
@@ -146,15 +144,6 @@ fn validate_actions(plan: &MappingPlan) -> Result<(), ApplyError> {
         let drive = action_drive(action);
         if !drive.is_ascii_alphabetic() || matches!(drive.to_ascii_uppercase(), 'A' | 'B' | 'C') {
             return Err(ApplyError::UnsafeDrive(drive));
-        }
-        let access = match action {
-            MappingAction::Create { access, .. } | MappingAction::Replace { access, .. } => {
-                Some(access)
-            }
-            MappingAction::Remove { .. } => None,
-        };
-        if access == Some(&MappingAccess::ReadOnly) {
-            return Err(ApplyError::ReadOnlyUnsupported(drive));
         }
         if let MappingAction::Create { host_path, .. } | MappingAction::Replace { host_path, .. } =
             action

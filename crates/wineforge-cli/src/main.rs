@@ -10,9 +10,12 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wineforge_core::{
-    ApplicationProfile, CurrentMapping, EngineManifest, MappingAccess, MappingAction, Platform,
-    Translation, Validate, apply_mapping_plan, inspect_prefix, plan_mappings,
+    ApplicationProfile, CurrentMapping, EngineManifest, IsolationMode, MappingAccess,
+    MappingAction, Platform, Translation, Validate, apply_mapping_plan, inspect_prefix,
+    plan_mappings,
 };
+
+mod sandbox;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -181,12 +184,12 @@ fn main() -> Result<()> {
             )?,
         },
         Command::ValidateProfile { profile } => {
-            let profile: ApplicationProfile = read_json(&profile)?;
+            let profile: ApplicationProfile = read_config(&profile)?;
             profile.validate().context("profile validation failed")?;
             println!("valid profile: {}", profile.id);
         }
         Command::ValidateEngine { manifest } => {
-            let manifest: EngineManifest = read_json(&manifest)?;
+            let manifest: EngineManifest = read_config(&manifest)?;
             manifest
                 .validate()
                 .context("engine manifest validation failed")?;
@@ -222,13 +225,13 @@ fn main() -> Result<()> {
 }
 
 fn read_profile(path: &Path) -> Result<ApplicationProfile> {
-    let profile: ApplicationProfile = read_json(path)?;
+    let profile: ApplicationProfile = read_config(path)?;
     profile.validate().context("profile validation failed")?;
     Ok(profile)
 }
 
 fn read_engine(path: &Path) -> Result<EngineManifest> {
-    let engine: EngineManifest = read_json(path)?;
+    let engine: EngineManifest = read_config(path)?;
     engine
         .validate()
         .context("engine manifest validation failed")?;
@@ -513,10 +516,19 @@ fn relative_symlink_stays_in_engine(path: &Path, target: &Path) -> bool {
 }
 
 fn mapping_plan(profile: &ApplicationProfile) -> Result<wineforge_core::MappingPlan> {
-    Ok(plan_mappings(
-        profile,
-        &read_drive_mappings(&profile.prefix)?,
-    ))
+    let mut current = read_drive_mappings(&profile.prefix)?;
+    for observed in &mut current {
+        if let Some(desired) = profile.mappings.iter().find(|mapping| {
+            mapping.normalized_drive() == Some(observed.drive)
+                && mapping.host_path == observed.host_path
+        }) {
+            // A symlink records the target, not its access mode. The platform
+            // sandbox enforces the profile's mode at every launch, so an
+            // access-only profile change requires no prefix mutation.
+            observed.access = desired.access;
+        }
+    }
+    Ok(plan_mappings(profile, &current))
 }
 
 fn print_plan(profile: &ApplicationProfile) -> Result<()> {
@@ -618,12 +630,34 @@ fn add_wine_environment(
     engine: &EngineManifest,
 ) {
     command.env("WINEPREFIX", &profile.prefix);
+    if profile.isolation.mode == IsolationMode::Required {
+        let state = profile.prefix.join(".wineforge");
+        command
+            .env("HOME", state.join("home"))
+            .env("TMPDIR", state.join("tmp"));
+    }
     for (key, value) in &engine.environment.0 {
         command.env(key, value);
     }
     for (key, value) in &profile.environment.0 {
         command.env(key, value);
     }
+}
+
+fn prepare_private_runtime(profile: &ApplicationProfile) -> Result<()> {
+    if profile.isolation.mode == IsolationMode::Disabled {
+        return Ok(());
+    }
+    let state = profile.prefix.join(".wineforge");
+    fs::create_dir_all(state.join("home"))
+        .with_context(|| format!("failed to create private HOME beneath {}", state.display()))?;
+    fs::create_dir_all(state.join("tmp")).with_context(|| {
+        format!(
+            "failed to create private TMPDIR beneath {}",
+            state.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn add_winetricks_engine_environment(command: &mut ProcessCommand, wine: &Path) -> Result<()> {
@@ -675,10 +709,14 @@ fn create_app_instance(
         );
     }
 
+    fs::create_dir(&profile.prefix)
+        .with_context(|| format!("failed to create prefix: {}", profile.prefix.display()))?;
+
     let result = (|| -> Result<()> {
-        let mut wineboot = ProcessCommand::new(&wine);
+        prepare_private_runtime(profile)?;
+        let mut wineboot = sandbox::command(profile, engine_root, &wine)?;
         wineboot.args(["wineboot", "--init"]);
-        wineboot.current_dir(parent);
+        wineboot.current_dir(&profile.prefix);
         add_wine_environment(&mut wineboot, profile, engine);
         let status = wineboot
             .status()
@@ -689,7 +727,7 @@ fn create_app_instance(
         sanitize_prefix(&profile.prefix)?;
 
         if !profile.winetricks.is_empty() {
-            let mut winetricks = ProcessCommand::new(winetricks_command);
+            let mut winetricks = sandbox::command(profile, engine_root, winetricks_command)?;
             winetricks.arg("-q").args(&profile.winetricks);
             winetricks.current_dir(profile.prefix.join("drive_c"));
             add_winetricks_engine_environment(&mut winetricks, &wine)?;
@@ -834,8 +872,9 @@ fn run_profile(
         verify_profile(profile).context("launch failed closed because mapping state drifted")?;
     }
     verify_host_exposure(profile)?;
+    prepare_private_runtime(profile)?;
     let wine = engine_wine(engine, engine_root)?;
-    let mut command = ProcessCommand::new(&wine);
+    let mut command = sandbox::command(profile, engine_root, &wine)?;
     command.arg(&profile.executable).args(&profile.arguments);
     command.current_dir(profile.prefix.join("drive_c"));
     add_wine_environment(&mut command, profile, engine);
@@ -873,6 +912,21 @@ fn rosetta_available() -> bool {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {} as UTF-8", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))
+        }
+        Some("json") => read_json(path),
+        _ => bail!(
+            "configuration must use a .toml extension (preferred) or .json for compatibility: {}",
+            path.display()
+        ),
+    }
 }
 
 fn print_inspection(prefix: &Path) -> Result<()> {
@@ -990,6 +1044,7 @@ mod tests {
             environment: Environment::default(),
             winetricks: Vec::new(),
             mappings: Vec::new(),
+            isolation: wineforge_core::IsolationPolicy::default(),
         }
     }
 
@@ -1044,6 +1099,29 @@ mod tests {
                 .next()
                 .is_some_and(|path| path == bin)
         );
+    }
+
+    #[test]
+    fn configuration_prefers_toml_and_keeps_json_compatibility() {
+        let temp = tempdir().unwrap();
+        let value = profile(&temp.path().join("prefix"));
+        let toml_path = temp.path().join("profile.toml");
+        fs::write(&toml_path, toml::to_string_pretty(&value).unwrap()).unwrap();
+        assert_eq!(
+            read_config::<ApplicationProfile>(&toml_path).unwrap(),
+            value
+        );
+
+        let json_path = temp.path().join("profile.json");
+        write_json(&json_path, &value).unwrap();
+        assert_eq!(
+            read_config::<ApplicationProfile>(&json_path).unwrap(),
+            value
+        );
+
+        let ambiguous = temp.path().join("profile.conf");
+        fs::write(&ambiguous, "schema_version = 1").unwrap();
+        assert!(read_config::<ApplicationProfile>(&ambiguous).is_err());
     }
 
     #[test]
@@ -1165,6 +1243,27 @@ mod tests {
 
         symlink("/", prefix.join("dosdevices/z:")).unwrap();
         assert!(verify_host_exposure(&value).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn access_only_mapping_changes_do_not_mutate_the_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let mapped = temp.path().join("mapped");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&mapped).unwrap();
+        symlink(&mapped, prefix.join("dosdevices/r:")).unwrap();
+        let mut value = profile(&prefix);
+        value.mappings.push(wineforge_core::HostMapping {
+            drive: "R".into(),
+            host_path: mapped,
+            access: MappingAccess::ReadOnly,
+        });
+
+        assert!(mapping_plan(&value).unwrap().actions.is_empty());
     }
 
     #[test]

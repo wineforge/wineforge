@@ -1,0 +1,20 @@
+schema_version = 1
+id = "sample-engine-macos-x86_64"
+platform = "macos-x86-64"
+host_architecture = "x86_64"
+translation = "rosetta2"
+wine_binary = "bin/wine"
+
+[artifact]
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[artifact.source]
+kind = "user-supplied"
+
+[environment]
+WINEDEBUG = "-all"
+
+[license]
+name = "Example License"
+url = "https://example.invalid/license"
+acceptance_required = false

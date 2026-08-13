@@ -34,6 +34,7 @@ fn profile(prefix: &Path) -> ApplicationProfile {
                 .join("workspace"),
             access: MappingAccess::ReadWrite,
         }],
+        isolation: wineforge_core::IsolationPolicy::default(),
     }
 }
 
@@ -82,6 +83,46 @@ fn profile_validation_rejects_root_reserved_duplicate_and_unsafe_environment() {
     assert!(errors.contains("must be absolute"));
     assert!(errors.contains("verb is duplicated"));
     assert!(errors.contains("not an option or command"));
+}
+
+#[test]
+fn read_only_mapping_requires_isolation() {
+    let temp = tempdir().unwrap();
+    let mut value = profile(&temp.path().join("prefix"));
+    value.mappings[0].access = MappingAccess::ReadOnly;
+    value.isolation.mode = wineforge_core::IsolationMode::Disabled;
+
+    let errors = value.validate().unwrap_err().to_string();
+    assert!(errors.contains("read-only access requires operating-system isolation"));
+
+    value.isolation.mode = wineforge_core::IsolationMode::Required;
+    value.validate().unwrap();
+}
+
+#[test]
+fn conflicting_nested_mapping_access_is_rejected() {
+    let temp = tempdir().unwrap();
+    let mut value = profile(&temp.path().join("prefix"));
+    let parent = temp.path().join("workspace");
+    value.mappings = vec![
+        HostMapping {
+            drive: "R".into(),
+            host_path: parent.clone(),
+            access: MappingAccess::ReadOnly,
+        },
+        HostMapping {
+            drive: "W".into(),
+            host_path: parent.join("writable"),
+            access: MappingAccess::ReadWrite,
+        },
+    ];
+    assert!(
+        value
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps a mapping with conflicting access")
+    );
 }
 
 #[test]
@@ -233,7 +274,7 @@ fn apply_backs_up_existing_entry_and_verifies_result() {
 }
 
 #[test]
-fn apply_rejects_reserved_and_unenforceable_read_only_actions_before_mutation() {
+fn apply_rejects_reserved_actions_before_mutation() {
     let temp = tempdir().unwrap();
     let prefix = temp.path().join("prefix");
     fs::create_dir(&prefix).unwrap();
@@ -246,17 +287,6 @@ fn apply_rejects_reserved_and_unenforceable_read_only_actions_before_mutation() 
     assert!(matches!(
         apply_mapping_plan(&prefix, &reserved),
         Err(ApplyError::UnsafeDrive('C'))
-    ));
-    let readonly = wineforge_core::MappingPlan {
-        actions: vec![MappingAction::Create {
-            drive: 'W',
-            host_path: temp.path().join("host"),
-            access: MappingAccess::ReadOnly,
-        }],
-    };
-    assert!(matches!(
-        apply_mapping_plan(&prefix, &readonly),
-        Err(ApplyError::ReadOnlyUnsupported('W'))
     ));
     assert!(!prefix.join("dosdevices").exists());
 }

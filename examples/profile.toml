@@ -1,0 +1,29 @@
+schema_version = 1
+id = "sample-editor"
+name = "Sample Editor"
+prefix = "/absolute/path/to/sample-editor/prefix"
+executable = "C:\\Program Files\\Sample Editor\\editor.exe"
+arguments = []
+winetricks = ["corefonts"]
+
+[engines.macos-x86-64]
+id = "sample-engine-macos-x86_64"
+
+[engines.linux-x86-64]
+id = "sample-engine-linux-x86_64"
+
+[environment]
+WINEDEBUG = "-all"
+
+[isolation]
+mode = "required"
+
+[[mappings]]
+drive = "W"
+host_path = "/absolute/path/to/sample-workspace"
+access = "read-write"
+
+[[mappings]]
+drive = "R"
+host_path = "/absolute/path/to/reference-files"
+access = "read-only"

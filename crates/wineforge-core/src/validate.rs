@@ -4,7 +4,10 @@ use std::path::{Component, Path};
 
 use thiserror::Error;
 
-use crate::{ApplicationProfile, EngineManifest, HostMapping, Sha256Digest, Translation};
+use crate::{
+    ApplicationProfile, EngineManifest, HostMapping, IsolationMode, MappingAccess, Sha256Digest,
+    Translation,
+};
 
 pub trait Validate {
     fn validate(&self) -> Result<(), ValidationErrors>;
@@ -251,6 +254,32 @@ impl Validate for ApplicationProfile {
                     format!("{field}.host_path"),
                     "must not contain `..` components",
                 );
+            }
+            if mapping.access == MappingAccess::ReadOnly
+                && self.isolation.mode == IsolationMode::Disabled
+            {
+                push(
+                    &mut errors,
+                    format!("{field}.access"),
+                    "read-only access requires operating-system isolation",
+                );
+            }
+        }
+
+        for left in 0..self.mappings.len() {
+            for right in left + 1..self.mappings.len() {
+                let left_mapping = &self.mappings[left];
+                let right_mapping = &self.mappings[right];
+                if left_mapping.access != right_mapping.access
+                    && (left_mapping.host_path.starts_with(&right_mapping.host_path)
+                        || right_mapping.host_path.starts_with(&left_mapping.host_path))
+                {
+                    push(
+                        &mut errors,
+                        format!("mappings[{right}].host_path"),
+                        "overlaps a mapping with conflicting access",
+                    );
+                }
             }
         }
 
