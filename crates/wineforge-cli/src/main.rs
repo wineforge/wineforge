@@ -423,11 +423,21 @@ fn unpack_engine(archive: &Path, destination: &Path) -> Result<()> {
                 .link_name()
                 .context("invalid engine archive link")?
                 .context("engine archive link has no target")?;
-            if target.is_absolute()
-                || target
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
+            let safe_target = if entry_type.is_symlink() {
+                relative_symlink_stays_in_engine(&path, &target)
+            } else {
+                !target.is_absolute()
+                    && !target.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                    && target.components().next().is_some_and(|component| {
+                        component.as_os_str() == std::ffi::OsStr::new("wineforge-engine")
+                    })
+            };
+            if !safe_target {
                 bail!(
                     "unsafe link target in engine archive: {} -> {}",
                     path.display(),
@@ -440,6 +450,28 @@ fn unpack_engine(archive: &Path, destination: &Path) -> Result<()> {
             .context("failed to unpack engine archive")?;
     }
     Ok(())
+}
+
+fn relative_symlink_stays_in_engine(path: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let mut depth = parent.components().count();
+    if depth == 0 {
+        return false;
+    }
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 1 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 fn mapping_plan(profile: &ApplicationProfile) -> Result<wineforge_core::MappingPlan> {
@@ -724,6 +756,26 @@ mod tests {
         let destination = temp.path().join("installed");
         assert!(install_engine(&archive_path, &manifest("0".repeat(64)), &destination).is_err());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn engine_archive_allows_internal_parent_symlink() {
+        assert!(relative_symlink_stays_in_engine(
+            Path::new("wineforge-engine/Framework.framework/Versions/A/Resources"),
+            Path::new("../../../share/resources")
+        ));
+    }
+
+    #[test]
+    fn engine_archive_rejects_escaping_parent_symlink() {
+        assert!(!relative_symlink_stays_in_engine(
+            Path::new("wineforge-engine/bin/wine"),
+            Path::new("../../outside")
+        ));
+        assert!(!relative_symlink_stays_in_engine(
+            Path::new("wineforge-engine/bin/wine"),
+            Path::new("/tmp/outside")
+        ));
     }
 
     #[test]
