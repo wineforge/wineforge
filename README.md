@@ -24,6 +24,9 @@ isolation remains platform-dependent.
   a shell.
 - Unknown configuration fields are rejected.
 - Prefix mutations are planned and verified before launch.
+- Every newly created app instance gets a dedicated fresh prefix. Host-root and
+  macOS/Linux user-folder convenience links are removed before use.
+- Winetricks dependencies are a validated list of verbs, never a shell command.
 
 ## Workspace
 
@@ -51,6 +54,11 @@ wineforge validate-engine engine.runtime.json
 # Verify and install a CI-built, content-addressed engine archive.
 wineforge install-engine engine.tar.gz engine.runtime.json /absolute/engine/destination
 
+# Normally optional: `run` performs this automatically when the prefix is absent.
+wineforge app create profile.json \
+  --engine-manifest engine.runtime.json \
+  --engine-root /absolute/engine/destination/wineforge-engine
+
 # Preview and then delete a managed engine installed beneath a store.
 wineforge engine prune --store /absolute/engine/store --id ENGINE_ID
 wineforge engine prune --store /absolute/engine/store --id ENGINE_ID --yes
@@ -66,6 +74,8 @@ wineforge apply profile.json --yes
 wineforge verify profile.json
 
 # Launch fails closed on mapping drift unless --apply is explicitly supplied.
+# An absent prefix is initialized, sanitized, provisioned, and marked as a
+# managed app instance automatically. An existing unmanaged prefix is refused.
 wineforge run profile.json \
   --engine-manifest engine.runtime.json \
   --engine-root /absolute/engine/destination/wineforge-engine
@@ -79,6 +89,19 @@ without `--yes`.
 
 Profiles never contain shell command strings. Wineforge passes the executable
 and each argument directly to the selected Wine process.
+
+Profiles may declare Winetricks verbs as a typed array:
+
+```json
+"winetricks": ["corefonts", "vcrun2022"]
+```
+
+During first creation Wineforge initializes `drive_c`, removes `Z:` and all
+other undeclared host-facing symlinks, replaces linked Windows user folders
+with private directories, invokes Winetricks once with the declared verbs, and
+then repeats sanitization before applying declared drive mappings. Every launch
+audits the full prefix and refuses any host-facing symlink other than an exact
+declared drive mapping.
 
 Engine build definitions and application recipes live in separate repositories.
 
