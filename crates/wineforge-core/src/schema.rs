@@ -24,6 +24,26 @@ pub struct ApplicationProfile {
     pub winetricks: Vec<String>,
     #[serde(default)]
     pub mappings: Vec<HostMapping>,
+    /// Filesystem confinement applied to Wine and every child process.
+    #[serde(default)]
+    pub isolation: IsolationPolicy,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationPolicy {
+    #[serde(default)]
+    pub mode: IsolationMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationMode {
+    /// Refuse launch unless the platform confinement backend can be applied.
+    #[default]
+    Required,
+    /// Run without operating-system confinement. Intended only for diagnosis.
+    Disabled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

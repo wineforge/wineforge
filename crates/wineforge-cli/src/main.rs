@@ -10,9 +10,16 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wineforge_core::{
-    ApplicationProfile, CurrentMapping, EngineManifest, MappingAccess, MappingAction, Platform,
-    Translation, Validate, apply_mapping_plan, inspect_prefix, plan_mappings,
+    ApplicationProfile, CurrentMapping, EngineManifest, IsolationMode, MappingAccess,
+    MappingAction, Platform, Translation, Validate, apply_mapping_plan, inspect_prefix,
+    plan_mappings,
 };
+
+mod chocolatey;
+mod download;
+mod recipe;
+mod recipe_executor;
+mod sandbox;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +43,11 @@ enum Command {
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
+    },
+    /// Validate, inspect, and install declarative application recipes.
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
     },
     /// Validate a declarative application profile without changing anything.
     ValidateProfile { profile: PathBuf },
@@ -127,6 +139,53 @@ enum EngineCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RecipeCommand {
+    /// Validate recipe TOML without downloading or executing anything.
+    Validate { recipe: PathBuf },
+    /// Print a validated recipe's sources, actions, and postconditions.
+    Inspect { recipe: PathBuf },
+    /// Inspect the metadata and translatability of a local Chocolatey package.
+    InspectNupkg {
+        package: PathBuf,
+        #[arg(long)]
+        package_id: String,
+        #[arg(long)]
+        package_version: String,
+    },
+    /// Install a recipe into a fresh, isolated application prefix.
+    Install {
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long, default_value = "winetricks")]
+        winetricks_command: PathBuf,
+        /// Confirm acceptance after reviewing a recipe's required license notice.
+        #[arg(long)]
+        accept_license: bool,
+    },
+    /// Delete verified content-addressed source-cache entries.
+    PruneCache {
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// SHA-256 cache key to delete. May be repeated.
+        #[arg(long, conflicts_with = "all")]
+        sha256: Vec<String>,
+        /// Delete every content-addressed source in the cache.
+        #[arg(long)]
+        all: bool,
+        /// Apply the printed deletion plan.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 const ENGINE_MARKER: &str = ".wineforge-engine.json";
 const BUILD_ARTIFACT_MARKER: &str = ".wineforge-build-artifacts.json";
 const APP_INSTANCE_MARKER: &str = "instance.json";
@@ -180,13 +239,76 @@ fn main() -> Result<()> {
                 yes,
             )?,
         },
+        Command::Recipe { command } => match command {
+            RecipeCommand::Validate { recipe: path } => {
+                let recipe = recipe::read(&path)?;
+                println!("valid recipe: {} {}", recipe.id, recipe.version);
+            }
+            RecipeCommand::Inspect { recipe: path } => {
+                let recipe = recipe::read(&path)?;
+                recipe_executor::inspect(&recipe, &path)?;
+            }
+            RecipeCommand::InspectNupkg {
+                package,
+                package_id,
+                package_version,
+            } => {
+                let translation = chocolatey::translate(&package, &package_id, &package_version)?;
+                println!(
+                    "package\t{}\t{}\ninstaller\t{}\t{}\t{}\narguments\t{:?}\nsuccess-exit-codes\t{:?}",
+                    translation.metadata.id,
+                    translation.metadata.version,
+                    translation.sha256,
+                    match translation.installer_type {
+                        recipe::InstallerType::Exe => "exe",
+                        recipe::InstallerType::Msi => "msi",
+                    },
+                    translation.url,
+                    translation.arguments,
+                    translation.success_exit_codes,
+                );
+            }
+            RecipeCommand::Install {
+                recipe: path,
+                profile,
+                engine_manifest,
+                engine_root,
+                cache,
+                winetricks_command,
+                accept_license,
+            } => {
+                let recipe = recipe::read(&path)?;
+                let cache = cache.map_or_else(default_source_cache, Ok)?;
+                recipe_executor::install(
+                    &recipe,
+                    &path,
+                    &read_profile(&profile)?,
+                    &read_engine(&engine_manifest)?,
+                    &engine_root,
+                    &winetricks_command,
+                    &cache,
+                    accept_license,
+                )?;
+            }
+            RecipeCommand::PruneCache {
+                cache,
+                sha256,
+                all,
+                yes,
+            } => prune_source_cache(
+                &cache.map_or_else(default_source_cache, Ok)?,
+                &sha256,
+                all,
+                yes,
+            )?,
+        },
         Command::ValidateProfile { profile } => {
-            let profile: ApplicationProfile = read_json(&profile)?;
+            let profile: ApplicationProfile = read_config(&profile)?;
             profile.validate().context("profile validation failed")?;
             println!("valid profile: {}", profile.id);
         }
         Command::ValidateEngine { manifest } => {
-            let manifest: EngineManifest = read_json(&manifest)?;
+            let manifest: EngineManifest = read_config(&manifest)?;
             manifest
                 .validate()
                 .context("engine manifest validation failed")?;
@@ -221,14 +343,85 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bool) -> Result<()> {
+    if !all && digests.is_empty() {
+        bail!("select at least one --sha256 or pass --all");
+    }
+    validate_prune_store(cache)?;
+    for digest in digests {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("invalid lowercase SHA-256 cache key: {digest}");
+        }
+    }
+    let requested = digests.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(cache)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || (!all && !requested.contains(name.as_str()))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("unsafe source-cache entry: {}", entry.path().display());
+        }
+        candidates.push((name, entry.path()));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    if !all {
+        let found = candidates
+            .iter()
+            .map(|candidate| candidate.0.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = requested.difference(&found).copied().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("no source-cache entry found for: {}", missing.join(", "));
+        }
+    }
+    if candidates.is_empty() {
+        println!("nothing to prune: no source-cache entries matched");
+        return Ok(());
+    }
+    for (digest, path) in &candidates {
+        println!("prune\tsource-cache\t{digest}\t{}", path.display());
+    }
+    if !confirmed {
+        bail!("refusing deletion without --yes after reviewing the prune plan");
+    }
+    for (_, path) in candidates {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn default_source_cache() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let relative = Path::new("Library/Caches/wineforge/sources");
+    #[cfg(not(target_os = "macos"))]
+    let relative = Path::new(".cache/wineforge/sources");
+    let home = std::env::var_os("HOME").context("HOME is unavailable; pass --cache explicitly")?;
+    Ok(PathBuf::from(home).join(relative))
+}
+
 fn read_profile(path: &Path) -> Result<ApplicationProfile> {
-    let profile: ApplicationProfile = read_json(path)?;
+    let profile: ApplicationProfile = read_config(path)?;
     profile.validate().context("profile validation failed")?;
     Ok(profile)
 }
 
 fn read_engine(path: &Path) -> Result<EngineManifest> {
-    let engine: EngineManifest = read_json(path)?;
+    let engine: EngineManifest = read_config(path)?;
     engine
         .validate()
         .context("engine manifest validation failed")?;
@@ -513,10 +706,19 @@ fn relative_symlink_stays_in_engine(path: &Path, target: &Path) -> bool {
 }
 
 fn mapping_plan(profile: &ApplicationProfile) -> Result<wineforge_core::MappingPlan> {
-    Ok(plan_mappings(
-        profile,
-        &read_drive_mappings(&profile.prefix)?,
-    ))
+    let mut current = read_drive_mappings(&profile.prefix)?;
+    for observed in &mut current {
+        if let Some(desired) = profile.mappings.iter().find(|mapping| {
+            mapping.normalized_drive() == Some(observed.drive)
+                && mapping.host_path == observed.host_path
+        }) {
+            // A symlink records the target, not its access mode. The platform
+            // sandbox enforces the profile's mode at every launch, so an
+            // access-only profile change requires no prefix mutation.
+            observed.access = desired.access;
+        }
+    }
+    Ok(plan_mappings(profile, &current))
 }
 
 fn print_plan(profile: &ApplicationProfile) -> Result<()> {
@@ -618,12 +820,34 @@ fn add_wine_environment(
     engine: &EngineManifest,
 ) {
     command.env("WINEPREFIX", &profile.prefix);
+    if profile.isolation.mode == IsolationMode::Required {
+        let state = profile.prefix.join(".wineforge");
+        command
+            .env("HOME", state.join("home"))
+            .env("TMPDIR", state.join("tmp"));
+    }
     for (key, value) in &engine.environment.0 {
         command.env(key, value);
     }
     for (key, value) in &profile.environment.0 {
         command.env(key, value);
     }
+}
+
+fn prepare_private_runtime(profile: &ApplicationProfile) -> Result<()> {
+    if profile.isolation.mode == IsolationMode::Disabled {
+        return Ok(());
+    }
+    let state = profile.prefix.join(".wineforge");
+    fs::create_dir_all(state.join("home"))
+        .with_context(|| format!("failed to create private HOME beneath {}", state.display()))?;
+    fs::create_dir_all(state.join("tmp")).with_context(|| {
+        format!(
+            "failed to create private TMPDIR beneath {}",
+            state.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn add_winetricks_engine_environment(command: &mut ProcessCommand, wine: &Path) -> Result<()> {
@@ -675,10 +899,14 @@ fn create_app_instance(
         );
     }
 
+    fs::create_dir(&profile.prefix)
+        .with_context(|| format!("failed to create prefix: {}", profile.prefix.display()))?;
+
     let result = (|| -> Result<()> {
-        let mut wineboot = ProcessCommand::new(&wine);
+        prepare_private_runtime(profile)?;
+        let mut wineboot = sandbox::command(profile, engine_root, &wine)?;
         wineboot.args(["wineboot", "--init"]);
-        wineboot.current_dir(parent);
+        wineboot.current_dir(&profile.prefix);
         add_wine_environment(&mut wineboot, profile, engine);
         let status = wineboot
             .status()
@@ -689,7 +917,7 @@ fn create_app_instance(
         sanitize_prefix(&profile.prefix)?;
 
         if !profile.winetricks.is_empty() {
-            let mut winetricks = ProcessCommand::new(winetricks_command);
+            let mut winetricks = sandbox::command(profile, engine_root, winetricks_command)?;
             winetricks.arg("-q").args(&profile.winetricks);
             winetricks.current_dir(profile.prefix.join("drive_c"));
             add_winetricks_engine_environment(&mut winetricks, &wine)?;
@@ -834,8 +1062,9 @@ fn run_profile(
         verify_profile(profile).context("launch failed closed because mapping state drifted")?;
     }
     verify_host_exposure(profile)?;
+    prepare_private_runtime(profile)?;
     let wine = engine_wine(engine, engine_root)?;
-    let mut command = ProcessCommand::new(&wine);
+    let mut command = sandbox::command(profile, engine_root, &wine)?;
     command.arg(&profile.executable).args(&profile.arguments);
     command.current_dir(profile.prefix.join("drive_c"));
     add_wine_environment(&mut command, profile, engine);
@@ -873,6 +1102,21 @@ fn rosetta_available() -> bool {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("toml") => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {} as UTF-8", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))
+        }
+        Some("json") => read_json(path),
+        _ => bail!(
+            "configuration must use a .toml extension (preferred) or .json for compatibility: {}",
+            path.display()
+        ),
+    }
 }
 
 fn print_inspection(prefix: &Path) -> Result<()> {
@@ -990,6 +1234,7 @@ mod tests {
             environment: Environment::default(),
             winetricks: Vec::new(),
             mappings: Vec::new(),
+            isolation: wineforge_core::IsolationPolicy::default(),
         }
     }
 
@@ -1044,6 +1289,29 @@ mod tests {
                 .next()
                 .is_some_and(|path| path == bin)
         );
+    }
+
+    #[test]
+    fn configuration_prefers_toml_and_keeps_json_compatibility() {
+        let temp = tempdir().unwrap();
+        let value = profile(&temp.path().join("prefix"));
+        let toml_path = temp.path().join("profile.toml");
+        fs::write(&toml_path, toml::to_string_pretty(&value).unwrap()).unwrap();
+        assert_eq!(
+            read_config::<ApplicationProfile>(&toml_path).unwrap(),
+            value
+        );
+
+        let json_path = temp.path().join("profile.json");
+        write_json(&json_path, &value).unwrap();
+        assert_eq!(
+            read_config::<ApplicationProfile>(&json_path).unwrap(),
+            value
+        );
+
+        let ambiguous = temp.path().join("profile.conf");
+        fs::write(&ambiguous, "schema_version = 1").unwrap();
+        assert!(read_config::<ApplicationProfile>(&ambiguous).is_err());
     }
 
     #[test]
@@ -1167,6 +1435,27 @@ mod tests {
         assert!(verify_host_exposure(&value).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn access_only_mapping_changes_do_not_mutate_the_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let mapped = temp.path().join("mapped");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&mapped).unwrap();
+        symlink(&mapped, prefix.join("dosdevices/r:")).unwrap();
+        let mut value = profile(&prefix);
+        value.mappings.push(wineforge_core::HostMapping {
+            drive: "R".into(),
+            host_path: mapped,
+            access: MappingAccess::ReadOnly,
+        });
+
+        assert!(mapping_plan(&value).unwrap().actions.is_empty());
+    }
+
     #[test]
     fn prune_removes_only_selected_managed_engine() {
         let temp = tempdir().unwrap();
@@ -1257,5 +1546,23 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(directory.exists());
+    }
+
+    #[test]
+    fn source_cache_prune_removes_only_content_addressed_files() {
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("sources");
+        fs::create_dir(&cache).unwrap();
+        let selected = "a".repeat(64);
+        let retained = "b".repeat(64);
+        fs::write(cache.join(&selected), b"selected").unwrap();
+        fs::write(cache.join(&retained), b"retained").unwrap();
+        fs::write(cache.join("unmanaged-note"), b"unmanaged").unwrap();
+
+        prune_source_cache(&cache, std::slice::from_ref(&selected), false, true).unwrap();
+
+        assert!(!cache.join(selected).exists());
+        assert!(cache.join(retained).exists());
+        assert!(cache.join("unmanaged-note").exists());
     }
 }
