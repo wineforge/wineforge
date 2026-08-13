@@ -51,6 +51,15 @@ wineforge validate-engine engine.runtime.json
 # Verify and install a CI-built, content-addressed engine archive.
 wineforge install-engine engine.tar.gz engine.runtime.json /absolute/engine/destination
 
+# Preview and then delete a managed engine installed beneath a store.
+wineforge engine prune --store /absolute/engine/store --id ENGINE_ID
+wineforge engine prune --store /absolute/engine/store --id ENGINE_ID --yes
+
+# Delete a managed local build, including its work tree and engine archive.
+wineforge engine prune-artifacts \
+  --store /absolute/path/to/wineforge-engines/local-builds \
+  --id BUILD_ID --yes
+
 # Review before applying. Mutation requires an explicit confirmation flag.
 wineforge plan profile.json
 wineforge apply profile.json --yes
@@ -61,6 +70,12 @@ wineforge run profile.json \
   --engine-manifest engine.runtime.json \
   --engine-root /absolute/engine/destination/wineforge-engine
 ```
+
+Pruning only recognizes immediate child directories containing Wineforge's
+management marker; unrelated files and unmarked directories are ignored. Pass
+one or more `--profile` arguments to `engine prune` to protect engines selected
+by those profiles. `--all` selects every managed entry, and no deletion occurs
+without `--yes`.
 
 Profiles never contain shell command strings. Wineforge passes the executable
 and each argument directly to the selected Wine process.

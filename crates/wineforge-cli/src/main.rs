@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wineforge_core::{
     ApplicationProfile, CurrentMapping, EngineManifest, MappingAccess, MappingAction, Platform,
@@ -25,6 +27,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage locally installed and built engines.
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
     /// Validate a declarative application profile without changing anything.
     ValidateProfile { profile: PathBuf },
     /// Validate an engine manifest without downloading or executing it.
@@ -61,9 +68,82 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum EngineCommand {
+    /// Delete managed engine installations from a store.
+    Prune {
+        /// Directory whose immediate children are managed engine installations.
+        #[arg(long)]
+        store: PathBuf,
+        /// Engine identifier to delete. May be repeated.
+        #[arg(long, conflicts_with = "all")]
+        id: Vec<String>,
+        /// Delete every managed engine in the store.
+        #[arg(long)]
+        all: bool,
+        /// Profiles whose selected engines must be protected from deletion.
+        #[arg(long)]
+        profile: Vec<PathBuf>,
+        /// Apply the printed deletion plan.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete managed local build-artifact directories.
+    PruneArtifacts {
+        /// Directory whose immediate children are managed build-artifact directories.
+        #[arg(long)]
+        store: PathBuf,
+        /// Build identifier to delete. May be repeated.
+        #[arg(long, conflicts_with = "all")]
+        id: Vec<String>,
+        /// Delete every managed artifact directory in the store.
+        #[arg(long)]
+        all: bool,
+        /// Apply the printed deletion plan.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+const ENGINE_MARKER: &str = ".wineforge-engine.json";
+const BUILD_ARTIFACT_MARKER: &str = ".wineforge-build-artifacts.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedEntry {
+    schema_version: u32,
+    kind: String,
+    id: String,
+    artifact_sha256: Option<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Engine { command } => match command {
+            EngineCommand::Prune {
+                store,
+                id,
+                all,
+                profile,
+                yes,
+            } => prune_engines(&store, &id, all, &profile, yes)?,
+            EngineCommand::PruneArtifacts {
+                store,
+                id,
+                all,
+                yes,
+            } => prune_managed_entries(
+                &store,
+                BUILD_ARTIFACT_MARKER,
+                "build-artifacts",
+                "build artifacts",
+                &id,
+                all,
+                &BTreeSet::new(),
+                yes,
+            )?,
+        },
         Command::ValidateProfile { profile } => {
             let profile: ApplicationProfile = read_json(&profile)?;
             profile.validate().context("profile validation failed")?;
@@ -154,11 +234,151 @@ fn install_engine(archive: &Path, manifest: &EngineManifest, destination: &Path)
             wine.display()
         );
     }
+    let marker = ManagedEntry {
+        schema_version: 1,
+        kind: "engine".into(),
+        id: manifest.id.clone(),
+        artifact_sha256: Some(manifest.artifact.sha256.0.clone()),
+    };
+    if let Err(error) = write_json(&destination.join(ENGINE_MARKER), &marker) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error);
+    }
     println!(
         "installed engine {} at {}",
         manifest.id,
         engine_root.display()
     );
+    Ok(())
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn prune_engines(
+    store: &Path,
+    ids: &[String],
+    all: bool,
+    profiles: &[PathBuf],
+    confirmed: bool,
+) -> Result<()> {
+    let mut protected = BTreeSet::new();
+    for path in profiles {
+        let profile = read_profile(path)?;
+        protected.extend(
+            profile
+                .engines
+                .values()
+                .map(|selection| selection.id.clone()),
+        );
+    }
+    prune_managed_entries(
+        store,
+        ENGINE_MARKER,
+        "engine",
+        "engine",
+        ids,
+        all,
+        &protected,
+        confirmed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prune_managed_entries(
+    store: &Path,
+    marker_name: &str,
+    expected_kind: &str,
+    label: &str,
+    ids: &[String],
+    all: bool,
+    protected: &BTreeSet<String>,
+    confirmed: bool,
+) -> Result<()> {
+    if !all && ids.is_empty() {
+        bail!("select at least one --id or pass --all");
+    }
+    validate_prune_store(store)?;
+    let requested: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(store)
+        .with_context(|| format!("failed to read prune store {}", store.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let marker_path = path.join(marker_name);
+        let marker_metadata = match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+            bail!("unsafe managed marker: {}", marker_path.display());
+        }
+        let marker: ManagedEntry = read_json(&marker_path)?;
+        if marker.schema_version != 1 || marker.kind != expected_kind || marker.id.is_empty() {
+            bail!("invalid managed marker: {}", marker_path.display());
+        }
+        if !all && !requested.contains(marker.id.as_str()) {
+            continue;
+        }
+        if protected.contains(&marker.id) {
+            bail!(
+                "refusing to prune {label} {} because a supplied profile references it",
+                marker.id
+            );
+        }
+        candidates.push((marker.id, path));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    if !all {
+        let found: BTreeSet<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.0.as_str())
+            .collect();
+        let missing: Vec<_> = requested.difference(&found).copied().collect();
+        if !missing.is_empty() {
+            bail!("no managed {label} entry found for: {}", missing.join(", "));
+        }
+    }
+    if candidates.is_empty() {
+        println!("nothing to prune: no managed {label} entries matched");
+        return Ok(());
+    }
+    for (id, path) in &candidates {
+        println!("prune\t{label}\t{id}\t{}", path.display());
+    }
+    if !confirmed {
+        bail!("refusing deletion without --yes after reviewing the prune plan");
+    }
+    for (_, path) in candidates {
+        fs::remove_dir_all(&path).with_context(|| format!("failed to prune {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_prune_store(store: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(store)
+        .with_context(|| format!("invalid prune store: {}", store.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("prune store must be a real directory: {}", store.display());
+    }
+    let canonical = fs::canonicalize(store)?;
+    if canonical.parent().is_none()
+        || canonical.components().count() < 2
+        || canonical
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("refusing unsafe prune store: {}", canonical.display());
+    }
     Ok(())
 }
 
@@ -491,6 +711,9 @@ mod tests {
         let destination = temp.path().join("installed");
         install_engine(&archive_path, &manifest(digest), &destination).unwrap();
         assert!(destination.join("wineforge-engine/bin/wine").is_file());
+        let marker: ManagedEntry = read_json(&destination.join(ENGINE_MARKER)).unwrap();
+        assert_eq!(marker.kind, "engine");
+        assert_eq!(marker.id, "example-engine-macos-x86_64");
     }
 
     #[test]
@@ -501,5 +724,97 @@ mod tests {
         let destination = temp.path().join("installed");
         assert!(install_engine(&archive_path, &manifest("0".repeat(64)), &destination).is_err());
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn prune_removes_only_selected_managed_engine() {
+        let temp = tempdir().unwrap();
+        let store = temp.path().join("engines");
+        fs::create_dir(&store).unwrap();
+        for id in ["engine-one", "engine-two"] {
+            let directory = store.join(id);
+            fs::create_dir(&directory).unwrap();
+            write_json(
+                &directory.join(ENGINE_MARKER),
+                &ManagedEntry {
+                    schema_version: 1,
+                    kind: "engine".into(),
+                    id: id.into(),
+                    artifact_sha256: Some("0".repeat(64)),
+                },
+            )
+            .unwrap();
+        }
+        let unowned = store.join("unowned");
+        fs::create_dir(&unowned).unwrap();
+
+        prune_engines(&store, &["engine-one".into()], false, &[], true).unwrap();
+
+        assert!(!store.join("engine-one").exists());
+        assert!(store.join("engine-two").exists());
+        assert!(unowned.exists());
+    }
+
+    #[test]
+    fn prune_plan_requires_confirmation() {
+        let temp = tempdir().unwrap();
+        let store = temp.path().join("artifacts");
+        let directory = store.join("build-one");
+        fs::create_dir_all(&directory).unwrap();
+        write_json(
+            &directory.join(BUILD_ARTIFACT_MARKER),
+            &ManagedEntry {
+                schema_version: 1,
+                kind: "build-artifacts".into(),
+                id: "build-one".into(),
+                artifact_sha256: None,
+            },
+        )
+        .unwrap();
+
+        let result = prune_managed_entries(
+            &store,
+            BUILD_ARTIFACT_MARKER,
+            "build-artifacts",
+            "build artifacts",
+            &[],
+            true,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn prune_refuses_protected_engine() {
+        let temp = tempdir().unwrap();
+        let store = temp.path().join("engines");
+        let directory = store.join("engine-one");
+        fs::create_dir_all(&directory).unwrap();
+        write_json(
+            &directory.join(ENGINE_MARKER),
+            &ManagedEntry {
+                schema_version: 1,
+                kind: "engine".into(),
+                id: "engine-one".into(),
+                artifact_sha256: Some("0".repeat(64)),
+            },
+        )
+        .unwrap();
+
+        let protected = BTreeSet::from(["engine-one".into()]);
+        let result = prune_managed_entries(
+            &store,
+            ENGINE_MARKER,
+            "engine",
+            "engine",
+            &[],
+            true,
+            &protected,
+            true,
+        );
+        assert!(result.is_err());
+        assert!(directory.exists());
     }
 }
