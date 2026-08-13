@@ -16,9 +16,10 @@ exposure and unsafe prefix mutation. Required platform isolation additionally
 restricts direct Unix-path access by Wine and its children. On macOS the current
 CLI backend uses deprecated `sandbox-exec` and remains experimental pending a
 signed App Sandbox launcher; it protects conventional user-data and external
-volume roots, but it is not a system-wide default-deny sandbox. On Linux the
-backend requires Bubblewrap and constructs an empty mount namespace. Do not
-disable isolation for untrusted Windows software.
+volume roots, including installed application bundles under `/Applications`,
+but it is not a system-wide default-deny sandbox. On Linux the backend requires
+Bubblewrap and constructs an empty mount namespace. Do not disable isolation
+for untrusted Windows software.
 
 Engine manifests and release artifacts should be content-addressed. A matching
 digest establishes artifact integrity, not that the artifact is free of

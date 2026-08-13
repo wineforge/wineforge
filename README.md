@@ -32,8 +32,8 @@ long-term design. Linux uses Bubblewrap.
 - Linux Wine processes see only explicitly mounted system runtime files, the
   selected engine, the private prefix, and declared host mappings. The
   experimental macOS CLI backend denies undeclared reads and writes beneath
-  `/Users`, `/Volumes`, and `/Network`. Read-only mappings are enforced by the
-  operating-system backend.
+  `/Users`, `/Applications`, `/Volumes`, and `/Network`. Read-only mappings are
+  enforced by the operating-system backend.
 - Launch fails closed if required isolation is unavailable.
 
 ## Workspace

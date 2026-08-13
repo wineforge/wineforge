@@ -157,7 +157,7 @@ fn macos_policy(
     let readable = requirement(readable)?;
     let writable = requirement(writable)?;
     let mut policy = String::from("(version 1)\n(allow default)\n");
-    for protected_root in ["/Users", "/Volumes", "/Network"] {
+    for protected_root in ["/Users", "/Applications", "/Volumes", "/Network"] {
         policy.push_str(&format!(
             "(deny file-read-data (require-all (subpath \"{protected_root}\") (require-not {readable})))\n\
              (deny file-write* (require-all (subpath \"{protected_root}\") (require-not {writable})))\n"
@@ -251,6 +251,7 @@ mod tests {
         assert!(policy.contains("(deny file-write*"));
         assert!(policy.contains("/Users/example/read only"));
         assert!(policy.contains("/Users/example/read-write"));
+        assert!(policy.contains("/Applications"));
         assert!(policy.contains("/Volumes"));
         assert!(policy.contains("/Network"));
         assert!(policy.contains("(deny file-write* (subpath \"/Users/example/read only\"))"));
