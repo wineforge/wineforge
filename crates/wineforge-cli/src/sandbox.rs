@@ -231,11 +231,10 @@ fn linux_command(
     Ok(command)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn macos_policy_distinguishes_read_only_and_read_write_roots() {
         let policy = macos_policy(
@@ -257,7 +256,6 @@ mod tests {
         assert!(policy.contains("(deny file-write* (subpath \"/Users/example/read only\"))"));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_strings_are_escaped() {
         assert_eq!(seatbelt_escape("/tmp/a\\b\"c"), "/tmp/a\\\\b\\\"c");

@@ -15,6 +15,10 @@ use wineforge_core::{
     plan_mappings,
 };
 
+mod chocolatey;
+mod download;
+mod recipe;
+mod recipe_executor;
 mod sandbox;
 
 #[derive(Debug, Parser)]
@@ -39,6 +43,11 @@ enum Command {
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
+    },
+    /// Validate, inspect, and install declarative application recipes.
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
     },
     /// Validate a declarative application profile without changing anything.
     ValidateProfile { profile: PathBuf },
@@ -130,6 +139,53 @@ enum EngineCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RecipeCommand {
+    /// Validate recipe TOML without downloading or executing anything.
+    Validate { recipe: PathBuf },
+    /// Print a validated recipe's sources, actions, and postconditions.
+    Inspect { recipe: PathBuf },
+    /// Inspect the metadata and translatability of a local Chocolatey package.
+    InspectNupkg {
+        package: PathBuf,
+        #[arg(long)]
+        package_id: String,
+        #[arg(long)]
+        package_version: String,
+    },
+    /// Install a recipe into a fresh, isolated application prefix.
+    Install {
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long, default_value = "winetricks")]
+        winetricks_command: PathBuf,
+        /// Confirm acceptance after reviewing a recipe's required license notice.
+        #[arg(long)]
+        accept_license: bool,
+    },
+    /// Delete verified content-addressed source-cache entries.
+    PruneCache {
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// SHA-256 cache key to delete. May be repeated.
+        #[arg(long, conflicts_with = "all")]
+        sha256: Vec<String>,
+        /// Delete every content-addressed source in the cache.
+        #[arg(long)]
+        all: bool,
+        /// Apply the printed deletion plan.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 const ENGINE_MARKER: &str = ".wineforge-engine.json";
 const BUILD_ARTIFACT_MARKER: &str = ".wineforge-build-artifacts.json";
 const APP_INSTANCE_MARKER: &str = "instance.json";
@@ -183,6 +239,69 @@ fn main() -> Result<()> {
                 yes,
             )?,
         },
+        Command::Recipe { command } => match command {
+            RecipeCommand::Validate { recipe: path } => {
+                let recipe = recipe::read(&path)?;
+                println!("valid recipe: {} {}", recipe.id, recipe.version);
+            }
+            RecipeCommand::Inspect { recipe: path } => {
+                let recipe = recipe::read(&path)?;
+                recipe_executor::inspect(&recipe, &path)?;
+            }
+            RecipeCommand::InspectNupkg {
+                package,
+                package_id,
+                package_version,
+            } => {
+                let translation = chocolatey::translate(&package, &package_id, &package_version)?;
+                println!(
+                    "package\t{}\t{}\ninstaller\t{}\t{}\t{}\narguments\t{:?}\nsuccess-exit-codes\t{:?}",
+                    translation.metadata.id,
+                    translation.metadata.version,
+                    translation.sha256,
+                    match translation.installer_type {
+                        recipe::InstallerType::Exe => "exe",
+                        recipe::InstallerType::Msi => "msi",
+                    },
+                    translation.url,
+                    translation.arguments,
+                    translation.success_exit_codes,
+                );
+            }
+            RecipeCommand::Install {
+                recipe: path,
+                profile,
+                engine_manifest,
+                engine_root,
+                cache,
+                winetricks_command,
+                accept_license,
+            } => {
+                let recipe = recipe::read(&path)?;
+                let cache = cache.map_or_else(default_source_cache, Ok)?;
+                recipe_executor::install(
+                    &recipe,
+                    &path,
+                    &read_profile(&profile)?,
+                    &read_engine(&engine_manifest)?,
+                    &engine_root,
+                    &winetricks_command,
+                    &cache,
+                    accept_license,
+                )?;
+            }
+            RecipeCommand::PruneCache {
+                cache,
+                sha256,
+                all,
+                yes,
+            } => prune_source_cache(
+                &cache.map_or_else(default_source_cache, Ok)?,
+                &sha256,
+                all,
+                yes,
+            )?,
+        },
         Command::ValidateProfile { profile } => {
             let profile: ApplicationProfile = read_config(&profile)?;
             profile.validate().context("profile validation failed")?;
@@ -222,6 +341,77 @@ fn main() -> Result<()> {
         )?,
     }
     Ok(())
+}
+
+fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bool) -> Result<()> {
+    if !all && digests.is_empty() {
+        bail!("select at least one --sha256 or pass --all");
+    }
+    validate_prune_store(cache)?;
+    for digest in digests {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("invalid lowercase SHA-256 cache key: {digest}");
+        }
+    }
+    let requested = digests.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(cache)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || (!all && !requested.contains(name.as_str()))
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("unsafe source-cache entry: {}", entry.path().display());
+        }
+        candidates.push((name, entry.path()));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    if !all {
+        let found = candidates
+            .iter()
+            .map(|candidate| candidate.0.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = requested.difference(&found).copied().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("no source-cache entry found for: {}", missing.join(", "));
+        }
+    }
+    if candidates.is_empty() {
+        println!("nothing to prune: no source-cache entries matched");
+        return Ok(());
+    }
+    for (digest, path) in &candidates {
+        println!("prune\tsource-cache\t{digest}\t{}", path.display());
+    }
+    if !confirmed {
+        bail!("refusing deletion without --yes after reviewing the prune plan");
+    }
+    for (_, path) in candidates {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn default_source_cache() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let relative = Path::new("Library/Caches/wineforge/sources");
+    #[cfg(not(target_os = "macos"))]
+    let relative = Path::new(".cache/wineforge/sources");
+    let home = std::env::var_os("HOME").context("HOME is unavailable; pass --cache explicitly")?;
+    Ok(PathBuf::from(home).join(relative))
 }
 
 fn read_profile(path: &Path) -> Result<ApplicationProfile> {
@@ -1356,5 +1546,23 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(directory.exists());
+    }
+
+    #[test]
+    fn source_cache_prune_removes_only_content_addressed_files() {
+        let temp = tempdir().unwrap();
+        let cache = temp.path().join("sources");
+        fs::create_dir(&cache).unwrap();
+        let selected = "a".repeat(64);
+        let retained = "b".repeat(64);
+        fs::write(cache.join(&selected), b"selected").unwrap();
+        fs::write(cache.join(&retained), b"retained").unwrap();
+        fs::write(cache.join("unmanaged-note"), b"unmanaged").unwrap();
+
+        prune_source_cache(&cache, std::slice::from_ref(&selected), false, true).unwrap();
+
+        assert!(!cache.join(selected).exists());
+        assert!(cache.join(retained).exists());
+        assert!(cache.join("unmanaged-note").exists());
     }
 }
