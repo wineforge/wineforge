@@ -24,3 +24,11 @@ for untrusted Windows software.
 Engine manifests and release artifacts should be content-addressed. A matching
 digest establishes artifact integrity, not that the artifact is free of
 vulnerabilities or malicious behavior.
+
+Chocolatey compatibility does not execute package PowerShell. Wineforge opens a
+pinned `.nupkg` as a bounded ZIP container, parses its nuspec and a deliberately
+restricted static hashtable, and constructs a typed installer plan. Both the
+package and nested vendor installer require matching SHA-256 digests. These
+checks establish reviewed-byte identity; they do not prove that either artifact
+is benign. Unsupported or dynamic package behavior is rejected rather than
+delegated to a PowerShell runtime.

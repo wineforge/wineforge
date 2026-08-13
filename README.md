@@ -25,6 +25,9 @@ long-term design. Linux uses Bubblewrap.
 - Executables and arguments are arrays; profile values are never evaluated by
   a shell.
 - Unknown configuration fields are rejected.
+- Recipe downloads and translated Chocolatey vendor downloads are independently
+  pinned with SHA-256. Chocolatey PowerShell is parsed as untrusted data and is
+  never executed.
 - Prefix mutations are planned and verified before launch.
 - Every newly created app instance gets a dedicated fresh prefix. Host-root and
   macOS/Linux user-folder convenience links are removed before use.
@@ -58,6 +61,23 @@ cargo test --workspace
 wineforge inspect /absolute/path/to/prefix
 wineforge validate-profile profile.toml
 wineforge validate-engine engine.toml
+
+# Inspect a recipe or a local Chocolatey package without executing it.
+wineforge recipe validate recipe.toml
+wineforge recipe inspect recipe.toml
+wineforge recipe inspect-nupkg package.nupkg \
+  --package-id PACKAGE_ID --package-version PACKAGE_VERSION
+
+# Install into the fresh prefix named by the profile. This refuses an existing
+# prefix and removes the new prefix if any installation or postcondition fails.
+wineforge recipe install recipe.toml \
+  --profile profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/destination
+
+# Preview and delete verified, content-addressed installer/package cache entries.
+wineforge recipe prune-cache --sha256 SHA256
+wineforge recipe prune-cache --sha256 SHA256 --yes
 
 # Verify and install a CI-built, content-addressed engine archive.
 wineforge install-engine engine.tar.gz engine.toml /absolute/engine/destination
@@ -123,6 +143,28 @@ namespace. `mode = "disabled"` is an explicit diagnostic escape hatch and
 cannot be combined with read-only mappings.
 
 Engine build definitions and application recipes live in separate repositories.
+
+## Chocolatey package translation
+
+Wineforge can consume a pinned `.nupkg` through a recipe
+`chocolatey-package` action in `mode = "translate"`. It verifies the package,
+checks nuspec ID and version, reads `tools/chocolateyInstall.ps1`, and accepts
+one direct `Install-ChocolateyPackage @hashtable` call. Static x64 HTTPS URL,
+SHA-256 checksum, EXE/MSI type, silent arguments, and exit codes become the
+same native plan used by `run-installer`.
+
+No PowerShell, Chocolatey client, or .NET runtime is launched. Dynamic URLs,
+unknown interpolation, non-SHA-256 checksums, indirect calls, and multiple
+installer calls fail closed. A small allowlist expands inert silent-argument
+values for the private Windows temporary path and package identity. The vendor
+installer is downloaded and hashed separately, staged beneath `C:`, executed
+under the selected platform filesystem sandbox, and removed afterward.
+
+Version 1 executes `run-installer`, translated `chocolatey-package`,
+`create-directory`, and `winetricks` actions plus `file-exists`
+postconditions. Other schema actions are parsed but currently fail closed at
+execution. Recipe installation currently requires a fresh prefix; upgrading or
+transactionally modifying an existing app instance is not yet supported.
 
 ## Status
 
