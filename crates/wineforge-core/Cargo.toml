@@ -1,0 +1,20 @@
+[package]
+name = "wineforge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# Keep the core compatible with the workspace's Rust 1.85 minimum. Newer `url`
+# patch releases currently pull ICU crates requiring Rust 1.86.
+url = { version = "=2.5.4", features = ["serde"] }
+idna_adapter = "=1.2.0"
+
+[dev-dependencies]
+tempfile = "3.14"
