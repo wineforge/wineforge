@@ -311,6 +311,9 @@ impl Recipe {
                     }
                 }
             }
+            if let InstallStep::CopyFile { destination, .. } = step {
+                validate_install_path(destination, "copy-file destination")?;
+            }
             if let InstallStep::Winetricks { verbs } = step {
                 if verbs.is_empty() || verbs.len() > 32 {
                     bail!("winetricks requires between 1 and 32 verbs");
@@ -436,4 +439,18 @@ fn validate_windows_path(value: &str, label: &str) -> Result<()> {
         bail!("{label} contains an unsafe path component");
     }
     Ok(())
+}
+
+fn validate_install_path(value: &str, label: &str) -> Result<()> {
+    if let Some(relative) = value.strip_prefix("%APPDATA%\\") {
+        if relative.is_empty()
+            || relative
+                .split('\\')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            bail!("{label} contains an unsafe %APPDATA% path");
+        }
+        return Ok(());
+    }
+    validate_windows_path(value, label)
 }

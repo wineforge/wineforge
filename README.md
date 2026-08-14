@@ -209,6 +209,11 @@ A `run-installer` step can set `archiveMember` to run one exact installer file
 from a hash-verified ZIP source. Wineforge extracts only that member into its
 private staging directory and removes it after installation.
 
+`copy-file` verifies its declared source and atomically installs a new file. Its
+destination may use `%APPDATA%\\...`; Wineforge resolves that token to the sole
+real private user profile in the fresh prefix and rejects ambiguous profiles,
+links, traversal, and existing destinations.
+
 ## Native packages without an instance registry
 
 `wineforge run` remains an explicit, stateless execution primitive. Native
