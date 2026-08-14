@@ -205,6 +205,10 @@ closed at execution. Recipe installation currently requires a fresh prefix;
 upgrading or transactionally modifying an existing app instance is not yet
 supported.
 
+A `run-installer` step can set `archiveMember` to run one exact installer file
+from a hash-verified ZIP source. Wineforge extracts only that member into its
+private staging directory and removes it after installation.
+
 ## Native packages without an instance registry
 
 `wineforge run` remains an explicit, stateless execution primitive. Native

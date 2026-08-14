@@ -26,6 +26,7 @@ enum PlannedStep {
     RunInstaller {
         source: PathBuf,
         source_sha256: String,
+        archive_member: Option<String>,
         installer_type: InstallerType,
         arguments: Vec<String>,
         success_exit_codes: Vec<i32>,
@@ -128,6 +129,7 @@ pub fn install(
         match step {
             InstallStep::RunInstaller {
                 source,
+                archive_member,
                 installer_type,
                 arguments,
                 success_exit_codes,
@@ -140,6 +142,7 @@ pub fn install(
                 plan.push(PlannedStep::RunInstaller {
                     source: resolved,
                     source_sha256: declared.sha256().to_owned(),
+                    archive_member: archive_member.clone(),
                     installer_type: *installer_type,
                     arguments: arguments.clone(),
                     success_exit_codes: success_exit_codes.clone(),
@@ -172,6 +175,7 @@ pub fn install(
                 plan.push(PlannedStep::RunInstaller {
                     source: installer,
                     source_sha256: translated.sha256,
+                    archive_member: None,
                     installer_type: translated.installer_type,
                     arguments: translated.arguments,
                     success_exit_codes: translated.success_exit_codes,
@@ -274,6 +278,7 @@ fn execute_plan(
             PlannedStep::RunInstaller {
                 source,
                 source_sha256,
+                archive_member,
                 installer_type,
                 arguments,
                 success_exit_codes,
@@ -286,6 +291,7 @@ fn execute_plan(
                 index,
                 source,
                 source_sha256,
+                archive_member.as_deref(),
                 *installer_type,
                 arguments,
                 success_exit_codes,
@@ -493,6 +499,7 @@ fn run_installer(
     index: usize,
     source: &Path,
     source_sha256: &str,
+    archive_member: Option<&str>,
     installer_type: InstallerType,
     arguments: &[String],
     success_exit_codes: &[i32],
@@ -512,8 +519,12 @@ fn run_installer(
             staged.display()
         );
     }
-    fs::copy(source, &staged).context("failed to stage verified installer inside prefix")?;
-    download::verify_file(&staged, source_sha256)?;
+    if let Some(member) = archive_member {
+        extract_zip_member(source, member, &staged)?;
+    } else {
+        fs::copy(source, &staged).context("failed to stage verified installer inside prefix")?;
+        download::verify_file(&staged, source_sha256)?;
+    }
     let windows_path = format!("C:\\.wineforge-install\\step-{index}.{extension}");
     let result = (|| -> Result<()> {
         let mut command = sandbox::command(profile, engine_root, wine)?;
@@ -548,6 +559,65 @@ fn run_installer(
     cleanup?;
     if stage.read_dir()?.next().is_none() {
         fs::remove_dir(&stage)?;
+    }
+    Ok(())
+}
+
+fn extract_zip_member(source: &Path, member: &str, destination: &Path) -> Result<()> {
+    let file = File::open(source)
+        .with_context(|| format!("failed to open ZIP archive {}", source.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("invalid ZIP archive {}", source.display()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("ZIP archive contains too many entries");
+    }
+    let mut matching = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        validate_zip_entry_type(&entry)?;
+        if entry.name() == member {
+            matching.push(index);
+        }
+    }
+    if matching.len() != 1 {
+        bail!(
+            "ZIP archive member {member:?} must occur exactly once (found {})",
+            matching.len()
+        );
+    }
+    let mut entry = archive.by_index(matching[0])?;
+    if entry.is_dir() || entry.size() > MAX_EXTRACTED_BYTES {
+        bail!("ZIP installer member is not a regular file within the size limit");
+    }
+    let parent = destination
+        .parent()
+        .context("installer staging path has no parent")?;
+    ensure_real_directory(parent)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let copy_result = (|| -> Result<u64> {
+        let copied = std::io::copy(
+            &mut entry.by_ref().take(MAX_EXTRACTED_BYTES + 1),
+            &mut output,
+        )?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(copied)
+    })();
+    drop(output);
+    let copied = match copy_result {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+    };
+    if copied > MAX_EXTRACTED_BYTES {
+        let _ = fs::remove_file(destination);
+        bail!("ZIP installer member exceeds the 8 GiB extracted size limit");
     }
     Ok(())
 }
@@ -609,6 +679,30 @@ mod tests {
             b"patched"
         );
         assert_eq!(fs::read(destination.join("data.txt")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn extracts_exact_installer_member_only() {
+        let root = tempfile::tempdir().unwrap();
+        let source = archive(&[("Setup.exe", b"installer"), ("ignored.txt", b"ignored")]);
+        let destination = root.path().join("staged.exe");
+
+        extract_zip_member(source.path(), "Setup.exe", &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"installer");
+        assert!(!root.path().join("ignored.txt").exists());
+    }
+
+    #[test]
+    fn installer_member_must_exist_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let source = archive(&[("Setup.exe", b"installer")]);
+
+        assert!(
+            extract_zip_member(source.path(), "setup.exe", &root.path().join("staged.exe"))
+                .is_err()
+        );
+        assert!(!root.path().join("staged.exe").exists());
     }
 
     #[test]
