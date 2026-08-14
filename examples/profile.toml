@@ -4,7 +4,6 @@ name = "Sample Editor"
 prefix = "/absolute/path/to/sample-editor/prefix"
 executable = "C:\\Program Files\\Sample Editor\\editor.exe"
 arguments = []
-winetricks = ["corefonts"]
 
 [engines.macos-x86-64]
 id = "sample-engine-macos-x86_64"

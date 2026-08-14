@@ -19,9 +19,6 @@ pub struct ApplicationProfile {
     pub engines: BTreeMap<Platform, EngineSelection>,
     #[serde(default)]
     pub environment: Environment,
-    /// Declarative Winetricks verbs installed while creating the app instance.
-    #[serde(default)]
-    pub winetricks: Vec<String>,
     #[serde(default)]
     pub mappings: Vec<HostMapping>,
     /// Filesystem confinement applied to Wine and every child process.
