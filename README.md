@@ -178,10 +178,13 @@ installer is downloaded and hashed separately, staged beneath `C:`, executed
 under the selected platform filesystem sandbox, and removed afterward.
 
 Version 1 executes `run-installer`, translated `chocolatey-package`,
-`create-directory`, and `winetricks` actions plus `file-exists`
-postconditions. Other schema actions are parsed but currently fail closed at
-execution. Recipe installation currently requires a fresh prefix; upgrading or
-transactionally modifying an existing app instance is not yet supported.
+`create-directory`, `extract-archive`, and `winetricks` actions plus
+`file-exists` postconditions. ZIP archives are hash-verified before extraction;
+absolute paths, traversal, links, special files, duplicate destinations, and
+unsafe overlays fail closed. Other schema actions are parsed but currently fail
+closed at execution. Recipe installation currently requires a fresh prefix;
+upgrading or transactionally modifying an existing app instance is not yet
+supported.
 
 ## Status
 

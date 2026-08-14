@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use wineforge_core::Translation as EngineTranslation;
 use wineforge_core::{ApplicationProfile, EngineManifest};
+use zip::ZipArchive;
 
 use crate::chocolatey;
 use crate::download;
@@ -31,6 +33,12 @@ enum PlannedStep {
     },
     CreateDirectory {
         path: String,
+    },
+    ExtractArchive {
+        source: PathBuf,
+        source_sha256: String,
+        destination: String,
+        strip_components: u8,
     },
     Winetricks {
         verbs: Vec<String>,
@@ -173,6 +181,23 @@ pub fn install(
             InstallStep::CreateDirectory { path } => {
                 plan.push(PlannedStep::CreateDirectory { path: path.clone() });
             }
+            InstallStep::ExtractArchive {
+                source,
+                destination,
+                strip_components,
+            } => {
+                let declared = sources
+                    .get(source.as_str())
+                    .context("validated source disappeared")?;
+                let resolved = download::resolve(declared, recipe_dir, cache)?;
+                source_digests.insert(source.clone(), declared.sha256().to_owned());
+                plan.push(PlannedStep::ExtractArchive {
+                    source: resolved,
+                    source_sha256: declared.sha256().to_owned(),
+                    destination: destination.clone(),
+                    strip_components: *strip_components,
+                });
+            }
             InstallStep::Winetricks { verbs } => {
                 plan.push(PlannedStep::Winetricks {
                     verbs: verbs.clone(),
@@ -271,6 +296,16 @@ fn execute_plan(
                 fs::create_dir_all(&destination)
                     .with_context(|| format!("failed to create {}", destination.display()))?;
             }
+            PlannedStep::ExtractArchive {
+                source,
+                source_sha256,
+                destination,
+                strip_components,
+            } => {
+                download::verify_file(source, source_sha256)?;
+                let destination = windows_path_to_prefix(&profile.prefix, destination)?;
+                extract_zip_archive(source, &destination, *strip_components)?;
+            }
             PlannedStep::Winetricks { verbs } => {
                 let mut command = sandbox::command(profile, engine_root, winetricks_command)?;
                 command.arg("-q").args(verbs);
@@ -304,6 +339,149 @@ fn execute_plan(
     )?;
     println!("installed recipe {} {}", recipe.id, recipe.version);
     Ok(())
+}
+
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn extract_zip_archive(source: &Path, destination: &Path, strip_components: u8) -> Result<()> {
+    ensure_real_directory(destination)?;
+    let file = File::open(source)
+        .with_context(|| format!("failed to open ZIP archive {}", source.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("invalid ZIP archive {}", source.display()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("ZIP archive contains too many entries");
+    }
+
+    let mut extracted_bytes = 0_u64;
+    let mut destinations = BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        validate_zip_entry_type(&entry)?;
+        let relative = safe_zip_path(entry.name(), strip_components)?;
+        let Some(relative) = relative else {
+            continue;
+        };
+        if !destinations.insert(relative.clone()) {
+            bail!(
+                "ZIP archive contains a duplicate destination: {}",
+                relative.display()
+            );
+        }
+        let output = destination.join(&relative);
+        if entry.is_dir() {
+            ensure_real_directory(&output)?;
+            continue;
+        }
+
+        let parent = output
+            .parent()
+            .context("ZIP output has no parent directory")?;
+        ensure_real_directory(parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(&output) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "ZIP output would replace a non-regular file: {}",
+                    output.display()
+                );
+            }
+        }
+        let remaining = MAX_EXTRACTED_BYTES
+            .checked_sub(extracted_bytes)
+            .context("ZIP archive exceeds the extracted size limit")?;
+        let temporary = parent.join(format!(
+            ".{}.wineforge-{}-{index}.part",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("ZIP output filename is not UTF-8")?,
+            std::process::id()
+        ));
+        let mut staged = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "failed to create extraction staging file {}",
+                    temporary.display()
+                )
+            })?;
+        let copy_result = (|| -> Result<u64> {
+            let copied = std::io::copy(&mut entry.by_ref().take(remaining + 1), &mut staged)?;
+            if copied > remaining {
+                bail!("ZIP archive exceeds the 8 GiB extracted size limit");
+            }
+            staged.flush()?;
+            staged.sync_all()?;
+            Ok(copied)
+        })();
+        drop(staged);
+        let copied = match copy_result {
+            Ok(copied) => copied,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+        if let Err(error) = fs::rename(&temporary, &output) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error)
+                .with_context(|| format!("failed to commit extracted file {}", output.display()));
+        }
+        extracted_bytes += copied;
+    }
+    Ok(())
+}
+
+fn safe_zip_path(name: &str, strip_components: u8) -> Result<Option<PathBuf>> {
+    if name.contains('\0') || name.starts_with('/') || name.starts_with('\\') {
+        bail!("unsafe absolute ZIP entry path: {name:?}");
+    }
+    let normalized = name.replace('\\', "/");
+    let components: Vec<_> = normalized.trim_end_matches('/').split('/').collect();
+    if components.iter().any(|component| {
+        component.is_empty() || *component == "." || *component == ".." || component.contains(':')
+    }) {
+        bail!("unsafe ZIP entry path: {name:?}");
+    }
+    let stripped = components.get(usize::from(strip_components)..);
+    let Some(stripped) = stripped.filter(|parts| !parts.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(stripped.iter().collect()))
+}
+
+fn validate_zip_entry_type(entry: &zip::read::ZipFile<'_>) -> Result<()> {
+    if let Some(mode) = entry.unix_mode() {
+        let file_type = mode & 0o170000;
+        if file_type != 0 && file_type != 0o040000 && file_type != 0o100000 {
+            bail!(
+                "ZIP archive contains a link or special file: {:?}",
+                entry.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "extraction path is not a real directory: {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .context("extraction directory has no parent")?;
+    ensure_real_directory(parent)?;
+    fs::create_dir(path)
+        .with_context(|| format!("failed to create extraction directory {}", path.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -394,4 +572,86 @@ fn verify_postconditions(recipe: &Recipe, profile: &ApplicationProfile) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use zip::write::SimpleFileOptions;
+
+    fn archive(entries: &[(&str, &[u8])]) -> NamedTempFile {
+        let file = NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+        file
+    }
+
+    #[test]
+    fn zip_patch_safely_overlays_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("application");
+        let base = archive(&[("bin/app.exe", b"base"), ("data.txt", b"data")]);
+        let patch = archive(&[("bin/app.exe", b"patched")]);
+
+        extract_zip_archive(base.path(), &destination, 0).unwrap();
+        extract_zip_archive(patch.path(), &destination, 0).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("bin/app.exe")).unwrap(),
+            b"patched"
+        );
+        assert_eq!(fs::read(destination.join("data.txt")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn zip_strip_components_removes_the_declared_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("application");
+        let source = archive(&[("release/bin/app.exe", b"application")]);
+
+        extract_zip_archive(source.path(), &destination, 1).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("bin/app.exe")).unwrap(),
+            b"application"
+        );
+        assert!(!destination.join("release").exists());
+    }
+
+    #[test]
+    fn zip_traversal_is_rejected_without_writing_outside_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("application");
+        let source = archive(&[("../escaped.txt", b"escape")]);
+
+        assert!(extract_zip_archive(source.path(), &destination, 0).is_err());
+        assert!(!root.path().join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn zip_symlinks_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("application");
+        let file = NamedTempFile::new().unwrap();
+        let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
+        writer
+            .add_symlink(
+                "link",
+                "../../outside",
+                SimpleFileOptions::default().unix_permissions(0o777),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert!(extract_zip_archive(file.path(), &destination, 0).is_err());
+        assert!(!destination.join("link").exists());
+    }
 }
