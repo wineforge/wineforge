@@ -185,7 +185,7 @@ pub fn install(
         }
     }
 
-    create_app_instance(profile, engine, engine_root, winetricks_command)?;
+    create_app_instance(profile, engine, engine_root)?;
     let result = execute_plan(
         recipe,
         profile,

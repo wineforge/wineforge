@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -79,9 +80,6 @@ enum Command {
         engine_manifest: PathBuf,
         #[arg(long)]
         engine_root: PathBuf,
-        /// Winetricks executable used only when an absent instance is created.
-        #[arg(long, default_value = "winetricks")]
-        winetricks_command: PathBuf,
         /// Apply mapping changes before launch. Without this flag, drift fails closed.
         #[arg(long)]
         apply: bool,
@@ -90,13 +88,24 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AppCommand {
-    /// Create a fresh prefix, sanitize host integration, and install declared Winetricks verbs.
+    /// Create a fresh prefix and sanitize host integration.
     Create {
         profile: PathBuf,
         #[arg(long)]
         engine_manifest: PathBuf,
         #[arg(long)]
         engine_root: PathBuf,
+    },
+    /// Apply explicitly requested local Winetricks changes to a managed instance.
+    Provision {
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        /// Winetricks verb to install. May be repeated.
+        #[arg(long = "winetricks", required = true)]
+        winetricks: Vec<String>,
         #[arg(long, default_value = "winetricks")]
         winetricks_command: PathBuf,
     },
@@ -199,6 +208,22 @@ struct ManagedEntry {
     artifact_sha256: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualProvisions {
+    schema_version: u32,
+    profile_id: String,
+    entries: Vec<ManualProvisionEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualProvisionEntry {
+    engine_id: String,
+    winetricks: Vec<String>,
+    completed_unix_seconds: u64,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -207,12 +232,23 @@ fn main() -> Result<()> {
                 profile,
                 engine_manifest,
                 engine_root,
-                winetricks_command,
             } => create_app_instance(
                 &read_profile(&profile)?,
                 &read_engine(&engine_manifest)?,
                 &engine_root,
+            )?,
+            AppCommand::Provision {
+                profile,
+                engine_manifest,
+                engine_root,
+                winetricks,
+                winetricks_command,
+            } => provision_app(
+                &read_profile(&profile)?,
+                &read_engine(&engine_manifest)?,
+                &engine_root,
                 &winetricks_command,
+                &winetricks,
             )?,
         },
         Command::Engine { command } => match command {
@@ -330,13 +366,11 @@ fn main() -> Result<()> {
             profile,
             engine_manifest,
             engine_root,
-            winetricks_command,
             apply,
         } => run_profile(
             &read_profile(&profile)?,
             &read_engine(&engine_manifest)?,
             &engine_root,
-            &winetricks_command,
             apply,
         )?,
     }
@@ -874,7 +908,6 @@ fn create_app_instance(
     profile: &ApplicationProfile,
     engine: &EngineManifest,
     engine_root: &Path,
-    winetricks_command: &Path,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
     let wine = engine_wine(engine, engine_root)?;
@@ -916,25 +949,6 @@ fn create_app_instance(
         }
         sanitize_prefix(&profile.prefix)?;
 
-        if !profile.winetricks.is_empty() {
-            let mut winetricks = sandbox::command(profile, engine_root, winetricks_command)?;
-            winetricks.arg("-q").args(&profile.winetricks);
-            winetricks.current_dir(profile.prefix.join("drive_c"));
-            add_winetricks_engine_environment(&mut winetricks, &wine)?;
-            add_wine_environment(&mut winetricks, profile, engine);
-            let status = winetricks.status().with_context(|| {
-                format!(
-                    "failed to start Winetricks executable {}",
-                    winetricks_command.display()
-                )
-            })?;
-            if !status.success() {
-                bail!("Winetricks exited with {status}");
-            }
-            // Winetricks and Wine may recreate host convenience mappings.
-            sanitize_prefix(&profile.prefix)?;
-        }
-
         apply_profile(profile, true)?;
         verify_host_exposure(profile)?;
         write_json(
@@ -962,6 +976,107 @@ fn create_app_instance(
         })?;
     }
     result
+}
+
+fn validate_winetricks_verbs(verbs: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for verb in verbs {
+        let valid = !verb.is_empty()
+            && verb.len() <= 64
+            && verb
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && verb.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            });
+        if !valid {
+            bail!("invalid Winetricks verb {verb:?}; options and commands are not accepted");
+        }
+        if !unique.insert(verb) {
+            bail!("duplicate Winetricks verb {verb}");
+        }
+    }
+    Ok(())
+}
+
+fn provision_app(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+    winetricks_command: &Path,
+    verbs: &[String],
+) -> Result<()> {
+    validate_winetricks_verbs(verbs)?;
+    validate_engine_selection(profile, engine)?;
+    verify_managed_instance(profile)?;
+    verify_profile(profile).context("provisioning failed closed because mapping state drifted")?;
+    verify_host_exposure(profile)?;
+    prepare_private_runtime(profile)?;
+    let wine = engine_wine(engine, engine_root)?;
+    let mut command = sandbox::command(profile, engine_root, winetricks_command)?;
+    command.arg("-q").args(verbs);
+    command.current_dir(profile.prefix.join("drive_c"));
+    add_winetricks_engine_environment(&mut command, &wine)?;
+    add_wine_environment(&mut command, profile, engine);
+    let status = command.status().with_context(|| {
+        format!(
+            "failed to start Winetricks executable {}",
+            winetricks_command.display()
+        )
+    })?;
+    // Wine and Winetricks may recreate host-facing convenience links even when
+    // provisioning fails, so sanitization and exposure verification are unconditional.
+    sanitize_prefix(&profile.prefix)?;
+    verify_host_exposure(profile)?;
+    if !status.success() {
+        bail!("Winetricks exited with {status}");
+    }
+
+    let receipt_path = profile
+        .prefix
+        .join(".wineforge")
+        .join("manual-provisions.json");
+    let mut receipt = if receipt_path.exists() {
+        let metadata = fs::symlink_metadata(&receipt_path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "unsafe manual-provision receipt: {}",
+                receipt_path.display()
+            );
+        }
+        let receipt: ManualProvisions = read_json(&receipt_path)?;
+        if receipt.schema_version != 1 || receipt.profile_id != profile.id {
+            bail!(
+                "manual-provision receipt does not match profile {}",
+                profile.id
+            );
+        }
+        receipt
+    } else {
+        ManualProvisions {
+            schema_version: 1,
+            profile_id: profile.id.clone(),
+            entries: Vec::new(),
+        }
+    };
+    receipt.entries.push(ManualProvisionEntry {
+        engine_id: engine.id.clone(),
+        winetricks: verbs.to_vec(),
+        completed_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs(),
+    });
+    write_json(&receipt_path, &receipt)?;
+    println!(
+        "manually provisioned {} with Winetricks verbs: {}",
+        profile.id,
+        verbs.join(", ")
+    );
+    Ok(())
 }
 
 fn sanitize_prefix(prefix: &Path) -> Result<()> {
@@ -1048,12 +1163,11 @@ fn run_profile(
     profile: &ApplicationProfile,
     engine: &EngineManifest,
     engine_root: &Path,
-    winetricks_command: &Path,
     apply: bool,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
     if fs::symlink_metadata(&profile.prefix).is_err() {
-        create_app_instance(profile, engine, engine_root, winetricks_command)?;
+        create_app_instance(profile, engine, engine_root)?;
     }
     verify_managed_instance(profile)?;
     if apply {
@@ -1232,7 +1346,6 @@ mod tests {
                 },
             )]),
             environment: Environment::default(),
-            winetricks: Vec::new(),
             mappings: Vec::new(),
             isolation: wineforge_core::IsolationPolicy::default(),
         }
@@ -1289,6 +1402,14 @@ mod tests {
                 .next()
                 .is_some_and(|path| path == bin)
         );
+    }
+
+    #[test]
+    fn manual_winetricks_rejects_options_and_duplicates() {
+        assert!(validate_winetricks_verbs(&["corefonts".into(), "vcrun2022".into()]).is_ok());
+        assert!(validate_winetricks_verbs(&["--force".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["corefonts".into(), "corefonts".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["CoreFonts".into()]).is_err());
     }
 
     #[test]

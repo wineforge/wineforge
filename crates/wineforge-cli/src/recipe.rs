@@ -295,6 +295,31 @@ impl Recipe {
                     bail!("run-installer requires at least one successExitCodes value");
                 }
             }
+            if let InstallStep::Winetricks { verbs } = step {
+                if verbs.is_empty() || verbs.len() > 32 {
+                    bail!("winetricks requires between 1 and 32 verbs");
+                }
+                let mut unique = BTreeSet::new();
+                for verb in verbs {
+                    let valid = verb.len() <= 64
+                        && !verb.is_empty()
+                        && verb
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                        && verb.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-' | b'.')
+                        });
+                    if !valid {
+                        bail!("invalid Winetricks recipe verb {verb:?}");
+                    }
+                    if !unique.insert(verb) {
+                        bail!("duplicate Winetricks recipe verb {verb}");
+                    }
+                }
+            }
         }
         for check in &self.verify {
             if let Postcondition::FileExists { path, sha256 } = check {
