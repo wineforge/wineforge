@@ -126,16 +126,33 @@ generated receipts, SBOMs and attestations remain JSON. Neutral examples are in
 [`examples/profile.toml`](examples/profile.toml) and
 [`examples/engine.toml`](examples/engine.toml).
 
-Profiles may declare Winetricks verbs as a typed array:
+Application dependencies belong in recipes as typed installation actions:
 
 ```toml
-winetricks = ["corefonts", "vcrun2022"]
+[[install]]
+action = "winetricks"
+verbs = ["corefonts", "vcrun2022"]
 ```
+
+For an explicitly local, non-reproducible adjustment to an existing managed
+instance, use a manual provisioning command instead of changing the profile:
+
+```sh
+wineforge app provision profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/destination \
+  --winetricks corefonts \
+  --winetricks vcrun2022
+```
+
+Manual provisioning validates verbs, runs under the selected platform sandbox,
+re-sanitizes the prefix even after failure, and records the change beneath the
+instance's `.wineforge` state directory. Profiles deliberately reject a
+`winetricks` field.
 
 During first creation Wineforge initializes `drive_c`, removes `Z:` and all
 other undeclared host-facing symlinks, replaces linked Windows user folders
-with private directories, invokes Winetricks once with the declared verbs, and
-then repeats sanitization before applying declared drive mappings. Every launch
+with private directories, and applies declared drive mappings. Every launch
 audits the full prefix and refuses any host-facing symlink other than an exact
 declared drive mapping. With `isolation.mode = "required"` (the default), the
 launcher also confines direct Unix-path access such as Wine's `\\?\unix\`

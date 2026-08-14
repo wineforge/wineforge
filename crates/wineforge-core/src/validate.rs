@@ -186,31 +186,6 @@ impl Validate for ApplicationProfile {
         }
         validate_environment(&mut errors, "environment", &self.environment, true);
 
-        let mut winetricks = BTreeSet::new();
-        for (index, verb) in self.winetricks.iter().enumerate() {
-            let valid = !verb.is_empty()
-                && verb.len() <= 128
-                && !verb.starts_with('-')
-                && verb.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'_' | b'+' | b'-' | b'.' | b'=')
-                });
-            if !valid {
-                push(
-                    &mut errors,
-                    format!("winetricks[{index}]"),
-                    "must be a lowercase Winetricks verb, not an option or command",
-                );
-            } else if !winetricks.insert(verb) {
-                push(
-                    &mut errors,
-                    format!("winetricks[{index}]"),
-                    "verb is duplicated",
-                );
-            }
-        }
-
         let mut drives = BTreeSet::new();
         for (index, mapping) in self.mappings.iter().enumerate() {
             let field = format!("mappings[{index}]");
