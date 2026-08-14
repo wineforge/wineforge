@@ -928,7 +928,6 @@ mod tests {
                 },
             )]),
             environment: Environment::default(),
-            winetricks: Vec::new(),
             mappings: Vec::new(),
             isolation: IsolationPolicy {
                 mode: IsolationMode::Disabled,
