@@ -14,7 +14,7 @@ use serde::Serialize;
 use wineforge_core::{ApplicationProfile, EngineManifest};
 
 use crate::recipe::{Recipe, windows_path_to_prefix};
-use crate::{recipe_executor, resolved_engine_root};
+use crate::{recipe_executor, resolved_engine_root, shutdown_wineserver};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum NativeFormat {
@@ -125,6 +125,7 @@ fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
             request.cache,
             request.accept_license,
         )?;
+        shutdown_wineserver(&install_profile, request.engine, request.engine_root)?;
 
         let executable =
             windows_path_to_prefix(&install_profile.prefix, &install_profile.executable)?;
@@ -204,6 +205,7 @@ fn build_debian_package(request: &InstallRequest<'_>) -> Result<()> {
             request.cache,
             request.accept_license,
         )?;
+        shutdown_wineserver(&install_profile, request.engine, request.engine_root)?;
         let executable =
             windows_path_to_prefix(&install_profile.prefix, &install_profile.executable)?;
         write_icon_assets(&executable, &resources.join("AppIcon.png"), None)?;
@@ -819,6 +821,9 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&wine, fs::Permissions::from_mode(0o755)).unwrap();
+        let wineserver = engine_root.join("bin/wineserver");
+        fs::write(&wineserver, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&wineserver, fs::Permissions::from_mode(0o755)).unwrap();
         let runtime = temp.path().join("wineforge");
         let launcher = temp.path().join("wineforge-launcher");
         fs::write(&runtime, b"runtime").unwrap();

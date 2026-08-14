@@ -909,6 +909,39 @@ fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
     Ok(canonical_wine)
 }
 
+pub(crate) fn shutdown_wineserver(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+) -> Result<()> {
+    let wine = engine_wine(engine, engine_root)?;
+    let wineserver = wine
+        .parent()
+        .context("Wine executable has no parent directory")?
+        .join("wineserver");
+    let metadata = fs::symlink_metadata(&wineserver).with_context(|| {
+        format!(
+            "selected engine has no wineserver: {}",
+            wineserver.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("selected wineserver is not a regular file");
+    }
+    for argument in ["-k", "-w"] {
+        let mut command = sandbox::command(profile, engine_root, &wineserver)?;
+        command.arg(argument).current_dir(&profile.prefix);
+        add_wine_environment(&mut command, profile, engine);
+        let status = command
+            .status()
+            .with_context(|| format!("failed to run wineserver {argument}"))?;
+        if !status.success() {
+            bail!("wineserver {argument} exited with {status}");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolved_engine_root(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
     let direct_wine = engine_root.join(&engine.wine_binary);
     let resolved_root = if direct_wine.is_file() {
