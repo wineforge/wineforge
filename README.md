@@ -75,6 +75,25 @@ wineforge recipe install recipe.toml \
   --engine-manifest engine.toml \
   --engine-root /absolute/engine/destination
 
+# Build and install a self-contained macOS application bundle. The application
+# launcher resolves package-relative files and calls the unchanged `run` command.
+cargo build --release --bins
+wineforge install recipe.toml \
+  --profile profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/destination \
+  --format app \
+  --destination "$HOME/Applications/Wineforge/Example.app"
+
+# Build a Debian package with an immutable prefix template. Its launcher creates
+# a deterministic per-user prefix and then calls the same stateless `run` command.
+wineforge install recipe.toml \
+  --profile profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/destination \
+  --format deb \
+  --destination ./wineforge-app-example_1.0.0_amd64.deb
+
 # Preview and delete verified, content-addressed installer/package cache entries.
 wineforge recipe prune-cache --sha256 SHA256
 wineforge recipe prune-cache --sha256 SHA256 --yes
@@ -185,6 +204,39 @@ unsafe overlays fail closed. Other schema actions are parsed but currently fail
 closed at execution. Recipe installation currently requires a fresh prefix;
 upgrading or transactionally modifying an existing app instance is not yet
 supported.
+
+A `run-installer` step can set `archiveMember` to run one exact installer file
+from a hash-verified ZIP source. Wineforge extracts only that member into its
+private staging directory and removes it after installation.
+
+`copy-file` verifies its declared source and atomically installs a new file. Its
+destination may use `%APPDATA%\\...`; Wineforge resolves that token to the sole
+real private user profile in the fresh prefix and rejects ambiguous profiles,
+links, traversal, and existing destinations.
+
+## Native packages without an instance registry
+
+`wineforge run` remains an explicit, stateless execution primitive. Native
+packages embed the validated profile, engine manifest, recipe, Wineforge CLI,
+generic launcher, content-addressed engine, application icon, and installed
+prefix. The launcher discovers those paths relative to itself and invokes
+`wineforge run PROFILE --engine-manifest MANIFEST --engine-root ENGINE`; no
+Wineforge instance database is created.
+
+On macOS, `wineforge install --format app` atomically installs a relocatable
+`.app` bundle. Its writable prefix lives under `Contents/WinePrefix`, and its
+icon is extracted from the installed PE executable without executing it. On
+Linux, `--format deb` emits a native `amd64` package beneath `/opt/wineforge`.
+Because package-owned files are immutable, the launcher copies its verified
+prefix template to `$XDG_DATA_HOME/wineforge/instances/ID` (or
+`$HOME/.local/share/wineforge/instances/ID`) on first launch. Removing the
+package leaves that user data intact, matching normal Linux package behavior.
+
+Packages currently embed their engines for independent removal and portability.
+This deliberately trades disk space for a package that cannot break when a
+shared engine is pruned. Generated packages are local and unsigned; platform
+signing, notarization, RPM output, and document-type registration remain future
+work.
 
 ## Status
 

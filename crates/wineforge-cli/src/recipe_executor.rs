@@ -26,6 +26,7 @@ enum PlannedStep {
     RunInstaller {
         source: PathBuf,
         source_sha256: String,
+        archive_member: Option<String>,
         installer_type: InstallerType,
         arguments: Vec<String>,
         success_exit_codes: Vec<i32>,
@@ -39,6 +40,11 @@ enum PlannedStep {
         source_sha256: String,
         destination: String,
         strip_components: u8,
+    },
+    CopyFile {
+        source: PathBuf,
+        source_sha256: String,
+        destination: String,
     },
     Winetricks {
         verbs: Vec<String>,
@@ -128,6 +134,7 @@ pub fn install(
         match step {
             InstallStep::RunInstaller {
                 source,
+                archive_member,
                 installer_type,
                 arguments,
                 success_exit_codes,
@@ -140,6 +147,7 @@ pub fn install(
                 plan.push(PlannedStep::RunInstaller {
                     source: resolved,
                     source_sha256: declared.sha256().to_owned(),
+                    archive_member: archive_member.clone(),
                     installer_type: *installer_type,
                     arguments: arguments.clone(),
                     success_exit_codes: success_exit_codes.clone(),
@@ -172,6 +180,7 @@ pub fn install(
                 plan.push(PlannedStep::RunInstaller {
                     source: installer,
                     source_sha256: translated.sha256,
+                    archive_member: None,
                     installer_type: translated.installer_type,
                     arguments: translated.arguments,
                     success_exit_codes: translated.success_exit_codes,
@@ -196,6 +205,21 @@ pub fn install(
                     source_sha256: declared.sha256().to_owned(),
                     destination: destination.clone(),
                     strip_components: *strip_components,
+                });
+            }
+            InstallStep::CopyFile {
+                source,
+                destination,
+            } => {
+                let declared = sources
+                    .get(source.as_str())
+                    .context("validated source disappeared")?;
+                let resolved = download::resolve(declared, recipe_dir, cache)?;
+                source_digests.insert(source.clone(), declared.sha256().to_owned());
+                plan.push(PlannedStep::CopyFile {
+                    source: resolved,
+                    source_sha256: declared.sha256().to_owned(),
+                    destination: destination.clone(),
                 });
             }
             InstallStep::Winetricks { verbs } => {
@@ -274,6 +298,7 @@ fn execute_plan(
             PlannedStep::RunInstaller {
                 source,
                 source_sha256,
+                archive_member,
                 installer_type,
                 arguments,
                 success_exit_codes,
@@ -286,6 +311,7 @@ fn execute_plan(
                 index,
                 source,
                 source_sha256,
+                archive_member.as_deref(),
                 *installer_type,
                 arguments,
                 success_exit_codes,
@@ -306,6 +332,11 @@ fn execute_plan(
                 let destination = windows_path_to_prefix(&profile.prefix, destination)?;
                 extract_zip_archive(source, &destination, *strip_components)?;
             }
+            PlannedStep::CopyFile {
+                source,
+                source_sha256,
+                destination,
+            } => copy_file(profile, source, source_sha256, destination)?,
             PlannedStep::Winetricks { verbs } => {
                 let mut command = sandbox::command(profile, engine_root, winetricks_command)?;
                 command.arg("-q").args(verbs);
@@ -339,6 +370,94 @@ fn execute_plan(
     )?;
     println!("installed recipe {} {}", recipe.id, recipe.version);
     Ok(())
+}
+
+fn copy_file(
+    profile: &ApplicationProfile,
+    source: &Path,
+    source_sha256: &str,
+    destination: &str,
+) -> Result<()> {
+    download::verify_file(source, source_sha256)?;
+    let destination = install_path_to_prefix(&profile.prefix, destination)?;
+    if fs::symlink_metadata(&destination).is_ok() {
+        bail!(
+            "copy-file destination already exists: {}",
+            destination.display()
+        );
+    }
+    let parent = destination
+        .parent()
+        .context("copy-file destination has no parent")?;
+    ensure_real_directory(parent)?;
+    let filename = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("copy-file destination filename is not UTF-8")?;
+    let staged = parent.join(format!(".{filename}.wineforge-{}.part", std::process::id()));
+    if fs::symlink_metadata(&staged).is_ok() {
+        bail!(
+            "copy-file staging path already exists: {}",
+            staged.display()
+        );
+    }
+    fs::copy(source, &staged).context("failed to stage verified recipe file")?;
+    let result = (|| -> Result<()> {
+        download::verify_file(&staged, source_sha256)?;
+        fs::rename(&staged, &destination).with_context(|| {
+            format!("failed to commit recipe file to {}", destination.display())
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
+fn install_path_to_prefix(prefix: &Path, value: &str) -> Result<PathBuf> {
+    let Some(relative) = value.strip_prefix("%APPDATA%\\") else {
+        return windows_path_to_prefix(prefix, value);
+    };
+    if relative.is_empty()
+        || relative
+            .split('\\')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        bail!("unsafe %APPDATA% installation path: {value}");
+    }
+    let users = prefix.join("drive_c/users");
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&users)
+        .with_context(|| format!("failed to inspect Wine users directory {}", users.display()))?
+    {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case("public") {
+            continue;
+        }
+        let appdata = entry.path().join("AppData/Roaming");
+        if fs::symlink_metadata(&appdata)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            candidates.push(appdata);
+        }
+    }
+    if candidates.len() != 1 {
+        bail!(
+            "expected exactly one real Wine user AppData directory, found {}",
+            candidates.len()
+        );
+    }
+    let mut destination = candidates.pop().expect("length checked");
+    for part in relative.split('\\') {
+        destination.push(part);
+    }
+    Ok(destination)
 }
 
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
@@ -493,6 +612,7 @@ fn run_installer(
     index: usize,
     source: &Path,
     source_sha256: &str,
+    archive_member: Option<&str>,
     installer_type: InstallerType,
     arguments: &[String],
     success_exit_codes: &[i32],
@@ -512,8 +632,12 @@ fn run_installer(
             staged.display()
         );
     }
-    fs::copy(source, &staged).context("failed to stage verified installer inside prefix")?;
-    download::verify_file(&staged, source_sha256)?;
+    if let Some(member) = archive_member {
+        extract_zip_member(source, member, &staged)?;
+    } else {
+        fs::copy(source, &staged).context("failed to stage verified installer inside prefix")?;
+        download::verify_file(&staged, source_sha256)?;
+    }
     let windows_path = format!("C:\\.wineforge-install\\step-{index}.{extension}");
     let result = (|| -> Result<()> {
         let mut command = sandbox::command(profile, engine_root, wine)?;
@@ -548,6 +672,65 @@ fn run_installer(
     cleanup?;
     if stage.read_dir()?.next().is_none() {
         fs::remove_dir(&stage)?;
+    }
+    Ok(())
+}
+
+fn extract_zip_member(source: &Path, member: &str, destination: &Path) -> Result<()> {
+    let file = File::open(source)
+        .with_context(|| format!("failed to open ZIP archive {}", source.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("invalid ZIP archive {}", source.display()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("ZIP archive contains too many entries");
+    }
+    let mut matching = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        validate_zip_entry_type(&entry)?;
+        if entry.name() == member {
+            matching.push(index);
+        }
+    }
+    if matching.len() != 1 {
+        bail!(
+            "ZIP archive member {member:?} must occur exactly once (found {})",
+            matching.len()
+        );
+    }
+    let mut entry = archive.by_index(matching[0])?;
+    if entry.is_dir() || entry.size() > MAX_EXTRACTED_BYTES {
+        bail!("ZIP installer member is not a regular file within the size limit");
+    }
+    let parent = destination
+        .parent()
+        .context("installer staging path has no parent")?;
+    ensure_real_directory(parent)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let copy_result = (|| -> Result<u64> {
+        let copied = std::io::copy(
+            &mut entry.by_ref().take(MAX_EXTRACTED_BYTES + 1),
+            &mut output,
+        )?;
+        output.flush()?;
+        output.sync_all()?;
+        Ok(copied)
+    })();
+    drop(output);
+    let copied = match copy_result {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+    };
+    if copied > MAX_EXTRACTED_BYTES {
+        let _ = fs::remove_file(destination);
+        bail!("ZIP installer member exceeds the 8 GiB extracted size limit");
     }
     Ok(())
 }
@@ -609,6 +792,82 @@ mod tests {
             b"patched"
         );
         assert_eq!(fs::read(destination.join("data.txt")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn extracts_exact_installer_member_only() {
+        let root = tempfile::tempdir().unwrap();
+        let source = archive(&[("Setup.exe", b"installer"), ("ignored.txt", b"ignored")]);
+        let destination = root.path().join("staged.exe");
+
+        extract_zip_member(source.path(), "Setup.exe", &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"installer");
+        assert!(!root.path().join("ignored.txt").exists());
+    }
+
+    #[test]
+    fn appdata_install_path_resolves_the_single_private_wine_user() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("drive_c/users/Public")).unwrap();
+        fs::create_dir_all(root.path().join("drive_c/users/crossover/AppData/Roaming")).unwrap();
+
+        assert_eq!(
+            install_path_to_prefix(root.path(), "%APPDATA%\\sample\\settings.ini").unwrap(),
+            root.path()
+                .join("drive_c/users/crossover/AppData/Roaming/sample/settings.ini")
+        );
+        assert!(install_path_to_prefix(root.path(), "%APPDATA%\\..\\escape").is_err());
+    }
+
+    #[test]
+    fn copy_file_verifies_and_commits_into_appdata() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("drive_c/users/Public")).unwrap();
+        fs::create_dir_all(root.path().join("drive_c/users/crossover/AppData/Roaming")).unwrap();
+        let source = NamedTempFile::new().unwrap();
+        fs::write(source.path(), b"settings").unwrap();
+        let profile = ApplicationProfile {
+            schema_version: 1,
+            id: "sample.app".into(),
+            name: "Sample".into(),
+            prefix: root.path().to_path_buf(),
+            executable: "C:\\sample.exe".into(),
+            arguments: Vec::new(),
+            mappings: Vec::new(),
+            engines: BTreeMap::new(),
+            environment: Default::default(),
+            isolation: Default::default(),
+        };
+
+        copy_file(
+            &profile,
+            source.path(),
+            "cde0fb0dec1400c54a0f7e7eafa73624c53e4da258bbd34b3380a0defeba95c1",
+            "%APPDATA%\\sample\\settings.ini",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("drive_c/users/crossover/AppData/Roaming/sample/settings.ini")
+            )
+            .unwrap(),
+            b"settings"
+        );
+    }
+
+    #[test]
+    fn installer_member_must_exist_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let source = archive(&[("Setup.exe", b"installer")]);
+
+        assert!(
+            extract_zip_member(source.path(), "setup.exe", &root.path().join("staged.exe"))
+                .is_err()
+        );
+        assert!(!root.path().join("staged.exe").exists());
     }
 
     #[test]

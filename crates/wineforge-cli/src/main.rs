@@ -18,6 +18,7 @@ use wineforge_core::{
 
 mod chocolatey;
 mod download;
+mod native_package;
 mod recipe;
 mod recipe_executor;
 mod sandbox;
@@ -49,6 +50,35 @@ enum Command {
     Recipe {
         #[command(subcommand)]
         command: RecipeCommand,
+    },
+    /// Install a recipe as a registry-free native operating-system package.
+    Install {
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        /// Native package format. Defaults to app on macOS and deb on Linux.
+        #[arg(long, value_enum)]
+        format: Option<native_package::NativeFormat>,
+        /// Final .app directory or .deb file.
+        #[arg(long)]
+        destination: Option<PathBuf>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long, default_value = "winetricks")]
+        winetricks_command: PathBuf,
+        /// Wineforge executable embedded in the package. Defaults to this executable.
+        #[arg(long)]
+        wineforge_binary: Option<PathBuf>,
+        /// Generic native launcher embedded in the package. Defaults to a sibling binary.
+        #[arg(long)]
+        launcher_binary: Option<PathBuf>,
+        /// Confirm acceptance after reviewing the recipe's required license notice.
+        #[arg(long)]
+        accept_license: bool,
     },
     /// Validate a declarative application profile without changing anything.
     ValidateProfile { profile: PathBuf },
@@ -338,6 +368,47 @@ fn main() -> Result<()> {
                 yes,
             )?,
         },
+        Command::Install {
+            recipe: recipe_path,
+            profile: profile_path,
+            engine_manifest,
+            engine_root,
+            format,
+            destination,
+            cache,
+            winetricks_command,
+            wineforge_binary,
+            launcher_binary,
+            accept_license,
+        } => {
+            let recipe = recipe::read(&recipe_path)?;
+            let profile = read_profile(&profile_path)?;
+            let engine = read_engine(&engine_manifest)?;
+            let format = format.unwrap_or_else(native_package::host_default_format);
+            let destination = destination.map_or_else(
+                || native_package::default_destination(format, &recipe, &profile),
+                Ok,
+            )?;
+            let current_executable =
+                std::env::current_exe().context("failed to locate the Wineforge executable")?;
+            let wineforge_binary = wineforge_binary.unwrap_or_else(|| current_executable.clone());
+            let launcher_binary = launcher_binary
+                .unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
+            native_package::install(&native_package::InstallRequest {
+                recipe: &recipe,
+                recipe_path: &recipe_path,
+                profile: &profile,
+                engine: &engine,
+                engine_root: &engine_root,
+                destination: &destination,
+                format,
+                wineforge_binary: &wineforge_binary,
+                launcher_binary: &launcher_binary,
+                winetricks_command: &winetricks_command,
+                cache: &cache.map_or_else(default_source_cache, Ok)?,
+                accept_license,
+            })?;
+        }
         Command::ValidateProfile { profile } => {
             let profile: ApplicationProfile = read_config(&profile)?;
             profile.validate().context("profile validation failed")?;
@@ -826,6 +897,52 @@ fn validate_engine_selection(
 }
 
 fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
+    let resolved_root = resolved_engine_root(engine, engine_root)?;
+    let canonical_root = fs::canonicalize(&resolved_root)
+        .with_context(|| format!("invalid engine root: {}", engine_root.display()))?;
+    let wine = resolved_root.join(&engine.wine_binary);
+    let canonical_wine = fs::canonicalize(&wine)
+        .with_context(|| format!("Wine executable does not exist: {}", wine.display()))?;
+    if !canonical_wine.starts_with(&canonical_root) || !canonical_wine.is_file() {
+        bail!("declared Wine executable escapes the engine root");
+    }
+    Ok(canonical_wine)
+}
+
+pub(crate) fn shutdown_wineserver(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+) -> Result<()> {
+    let wine = engine_wine(engine, engine_root)?;
+    let wineserver = wine
+        .parent()
+        .context("Wine executable has no parent directory")?
+        .join("wineserver");
+    let metadata = fs::symlink_metadata(&wineserver).with_context(|| {
+        format!(
+            "selected engine has no wineserver: {}",
+            wineserver.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("selected wineserver is not a regular file");
+    }
+    for argument in ["-k", "-w"] {
+        let mut command = sandbox::command(profile, engine_root, &wineserver)?;
+        command.arg(argument).current_dir(&profile.prefix);
+        add_wine_environment(&mut command, profile, engine);
+        let status = command
+            .status()
+            .with_context(|| format!("failed to run wineserver {argument}"))?;
+        if !status.success() {
+            bail!("wineserver {argument} exited with {status}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn resolved_engine_root(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
     let direct_wine = engine_root.join(&engine.wine_binary);
     let resolved_root = if direct_wine.is_file() {
         engine_root.to_path_buf()
@@ -839,13 +956,13 @@ fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
     };
     let canonical_root = fs::canonicalize(&resolved_root)
         .with_context(|| format!("invalid engine root: {}", engine_root.display()))?;
-    let wine = resolved_root.join(&engine.wine_binary);
-    let canonical_wine = fs::canonicalize(&wine)
-        .with_context(|| format!("Wine executable does not exist: {}", wine.display()))?;
-    if !canonical_wine.starts_with(&canonical_root) || !canonical_wine.is_file() {
-        bail!("declared Wine executable escapes the engine root");
+    if !canonical_root.is_dir() {
+        bail!(
+            "engine root is not a directory: {}",
+            canonical_root.display()
+        );
     }
-    Ok(canonical_wine)
+    Ok(canonical_root)
 }
 
 fn add_wine_environment(

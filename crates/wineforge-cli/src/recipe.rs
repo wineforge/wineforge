@@ -108,6 +108,8 @@ impl Source {
 pub enum InstallStep {
     RunInstaller {
         source: String,
+        #[serde(rename = "archiveMember", default)]
+        archive_member: Option<String>,
         #[serde(rename = "installerType")]
         installer_type: InstallerType,
         arguments: Vec<String>,
@@ -288,12 +290,29 @@ impl Recipe {
                 }
             }
             if let InstallStep::RunInstaller {
-                success_exit_codes, ..
+                archive_member,
+                success_exit_codes,
+                ..
             } = step
             {
                 if success_exit_codes.is_empty() {
                     bail!("run-installer requires at least one successExitCodes value");
                 }
+                if let Some(member) = archive_member {
+                    if member.is_empty()
+                        || member.len() > 1024
+                        || member.contains('\\')
+                        || member.contains('\0')
+                        || member.split('/').any(|component| {
+                            component.is_empty() || matches!(component, "." | "..")
+                        })
+                    {
+                        bail!("run-installer archiveMember must be a safe ZIP member path");
+                    }
+                }
+            }
+            if let InstallStep::CopyFile { destination, .. } = step {
+                validate_install_path(destination, "copy-file destination")?;
             }
             if let InstallStep::Winetricks { verbs } = step {
                 if verbs.is_empty() || verbs.len() > 32 {
@@ -420,4 +439,18 @@ fn validate_windows_path(value: &str, label: &str) -> Result<()> {
         bail!("{label} contains an unsafe path component");
     }
     Ok(())
+}
+
+fn validate_install_path(value: &str, label: &str) -> Result<()> {
+    if let Some(relative) = value.strip_prefix("%APPDATA%\\") {
+        if relative.is_empty()
+            || relative
+                .split('\\')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            bail!("{label} contains an unsafe %APPDATA% path");
+        }
+        return Ok(());
+    }
+    validate_windows_path(value, label)
 }

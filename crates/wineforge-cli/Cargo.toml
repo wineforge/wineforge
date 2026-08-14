@@ -10,10 +10,17 @@ rust-version.workspace = true
 name = "wineforge"
 path = "src/main.rs"
 
+[[bin]]
+name = "wineforge-launcher"
+path = "src/launcher.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 flate2.workspace = true
+icns.workspace = true
+ico.workspace = true
+pelite.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
