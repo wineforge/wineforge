@@ -452,24 +452,7 @@ fn debian_control(
 }
 
 fn write_icon_assets(executable: &Path, png: &Path, icns: Option<&Path>) -> Result<()> {
-    let images = extract_pe_icons(executable).unwrap_or_default();
-    let mut images = if images.is_empty() {
-        vec![fallback_icon(256)]
-    } else {
-        images
-    };
-    if images
-        .iter()
-        .map(ico::IconImage::width)
-        .max()
-        .is_some_and(|width| width < 256)
-    {
-        let largest = images
-            .iter()
-            .max_by_key(|image| image.width() * image.height())
-            .context("icon image selection unexpectedly failed")?;
-        images.push(resize_icon_nearest(largest, 256));
-    }
+    let images = prepare_icon_images(extract_pe_icons(executable).unwrap_or_default());
     let largest = images
         .iter()
         .max_by_key(|image| image.width() * image.height())
@@ -503,6 +486,48 @@ fn write_icon_assets(executable: &Path, png: &Path, icns: Option<&Path>) -> Resu
         family.write(File::create(path)?)?;
     }
     Ok(())
+}
+
+fn prepare_icon_images(images: Vec<ico::IconImage>) -> Vec<ico::IconImage> {
+    if images.is_empty() {
+        return vec![fallback_icon(256)];
+    }
+
+    let largest = images
+        .iter()
+        .max_by_key(|image| image.width() * image.height())
+        .expect("non-empty icon collection has a largest image");
+    let largest_square = pad_icon_to_square(largest);
+    let mut prepared = images
+        .into_iter()
+        .filter(|image| {
+            image.width() == image.height()
+                && matches!(image.width(), 16 | 32 | 48 | 128 | 256 | 512 | 1024)
+        })
+        .collect::<Vec<_>>();
+    if !prepared.iter().any(|image| image.width() == 256) {
+        prepared.push(resize_icon_nearest(&largest_square, 256));
+    }
+    prepared
+}
+
+fn pad_icon_to_square(source: &ico::IconImage) -> ico::IconImage {
+    // Windows icons commonly fill their bitmap, while macOS app icons need
+    // transparent breathing room around the artwork to match Finder's visual scale.
+    let content_size = source.width().max(source.height());
+    let size = content_size.saturating_mul(5).div_ceil(4);
+    let x_offset = (size - source.width()) / 2;
+    let y_offset = (size - source.height()) / 2;
+    let mut rgba = vec![0_u8; (size * size * 4) as usize];
+    for y in 0..source.height() {
+        let source_start = (y * source.width() * 4) as usize;
+        let source_end = source_start + (source.width() * 4) as usize;
+        let destination_start = (((y + y_offset) * size + x_offset) * 4) as usize;
+        let destination_end = destination_start + (source.width() * 4) as usize;
+        rgba[destination_start..destination_end]
+            .copy_from_slice(&source.rgba_data()[source_start..source_end]);
+    }
+    ico::IconImage::from_rgba_data(size, size, rgba)
 }
 
 fn extract_pe_icons(executable: &Path) -> Result<Vec<ico::IconImage>> {
@@ -935,6 +960,22 @@ mod tests {
         assert_eq!(xml_escape("A&B<\""), "A&amp;B&lt;&quot;");
         assert_eq!(desktop_escape("Line\\Name\nNext"), "Line\\\\Name\\nNext");
         assert_eq!(macos_bundle_version("7.8-p1"), "7.8.1");
+    }
+
+    #[test]
+    fn malformed_non_square_pe_icon_is_normalized_for_native_packages() {
+        let malformed = ico::IconImage::from_rgba_data(265, 256, vec![255; 265 * 256 * 4]);
+        let small = ico::IconImage::from_rgba_data(32, 32, vec![127; 32 * 32 * 4]);
+
+        let prepared = prepare_icon_images(vec![small, malformed]);
+
+        assert!(prepared.iter().all(|image| image.width() == image.height()));
+        let normalized = prepared
+            .iter()
+            .find(|image| image.width() == 256)
+            .expect("a native-size icon is synthesized");
+        assert_eq!(normalized.rgba_data()[3], 0);
+        assert_eq!(normalized.rgba_data()[(128 * 256 + 128) * 4 + 3], 255);
     }
 
     #[test]
