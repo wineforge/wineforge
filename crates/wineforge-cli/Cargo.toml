@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Declarative, isolated Wine application launcher and prefix manager"
+readme = "../../README.md"
+keywords = ["wine", "windows", "macos", "linux", "launcher"]
+categories = ["command-line-utilities", "emulators"]
 
 [[bin]]
 name = "wineforge"
@@ -35,3 +39,9 @@ zip.workspace = true
 
 [dev-dependencies]
 tempfile = "3.14"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
