@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -19,6 +19,7 @@ use wineforge_core::{
 mod chocolatey;
 mod download;
 mod native_package;
+mod prepare;
 mod recipe;
 mod recipe_executor;
 mod sandbox;
@@ -36,6 +37,58 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Configure a profile, ensure its engine, and optionally install a native package.
+    Prepare {
+        recipe: PathBuf,
+        /// New TOML profile to create. Existing files are never overwritten.
+        #[arg(long)]
+        profile_out: PathBuf,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        /// Prefix used by stateless runs. Native packages replace it with a package-relative path.
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        /// Host mapping as DRIVE=read-only|read-write=/absolute/path. May be repeated.
+        #[arg(long = "mapping")]
+        mappings: Vec<String>,
+        #[arg(long)]
+        engine_store: Option<PathBuf>,
+        /// Trusted wineforge-engines checkout used only when a compatible engine is absent.
+        #[arg(long)]
+        engine_builder: Option<PathBuf>,
+        /// Pin one builder version instead of selecting the newest compatible version.
+        #[arg(long)]
+        engine_version: Option<String>,
+        /// Permit a missing engine to start a potentially long local build without prompting.
+        #[arg(long)]
+        build_if_missing: bool,
+        #[arg(long, value_enum, default_value = "auto")]
+        build_runtime: prepare::BuildRuntime,
+        /// Retain the archive and work tree after the verified engine is installed.
+        #[arg(long)]
+        keep_build_artifacts: bool,
+        /// Use supplied values and safe defaults without reading prompts from the terminal.
+        #[arg(long)]
+        non_interactive: bool,
+        /// After preparation, install an app or deb package using the generated profile.
+        #[arg(long, value_enum)]
+        then_install: Option<native_package::NativeFormat>,
+        #[arg(long, requires = "then_install")]
+        destination: Option<PathBuf>,
+        #[arg(long, requires = "then_install")]
+        cache: Option<PathBuf>,
+        #[arg(long, default_value = "winetricks", requires = "then_install")]
+        winetricks_command: PathBuf,
+        #[arg(long, requires = "then_install")]
+        wineforge_binary: Option<PathBuf>,
+        #[arg(long, requires = "then_install")]
+        launcher_binary: Option<PathBuf>,
+        /// Confirm acceptance after reviewing the recipe's required license notice.
+        #[arg(long)]
+        accept_license: bool,
+    },
     /// Create and manage isolated application instances.
     App {
         #[command(subcommand)]
@@ -138,6 +191,28 @@ enum AppCommand {
         winetricks: Vec<String>,
         #[arg(long, default_value = "winetricks")]
         winetricks_command: PathBuf,
+    },
+    /// Package a cloned existing Wine prefix as a managed macOS application.
+    Import {
+        /// Existing prefix to clone. The source is never modified.
+        source_prefix: PathBuf,
+        #[arg(long)]
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        /// Final .app directory.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Wineforge executable embedded in the package. Defaults to this executable.
+        #[arg(long)]
+        wineforge_binary: Option<PathBuf>,
+        /// Generic native launcher embedded in the package. Defaults to a sibling binary.
+        #[arg(long)]
+        launcher_binary: Option<PathBuf>,
     },
 }
 
@@ -257,6 +332,86 @@ struct ManualProvisionEntry {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Prepare {
+            recipe: recipe_path,
+            profile_out,
+            id,
+            name,
+            prefix,
+            mappings,
+            engine_store,
+            engine_builder,
+            engine_version,
+            build_if_missing,
+            build_runtime,
+            keep_build_artifacts,
+            non_interactive,
+            then_install,
+            destination,
+            cache,
+            winetricks_command,
+            wineforge_binary,
+            launcher_binary,
+            accept_license,
+        } => {
+            let recipe = recipe::read(&recipe_path)?;
+            if then_install.is_some()
+                && recipe.license.acceptance == recipe::LicenseAcceptance::Required
+                && !accept_license
+            {
+                bail!(
+                    "recipe license acceptance is required before preparation can continue to installation; review license.noticeUrl and pass --accept-license"
+                );
+            }
+            let engine_store = engine_store.map_or_else(prepare::default_engine_store, Ok)?;
+            if !engine_store.is_absolute()
+                || engine_store
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                bail!("engine store must be an absolute path without `..`");
+            }
+            match fs::symlink_metadata(&engine_store) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir_all(&engine_store).with_context(|| {
+                        format!("failed to create engine store {}", engine_store.display())
+                    })?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let prepared = prepare::execute(prepare::PrepareRequest {
+                recipe: &recipe,
+                profile_out: &profile_out,
+                profile_id: id,
+                profile_name: name,
+                prefix,
+                mappings,
+                engine_store: &engine_store,
+                engine_builder: engine_builder.as_deref(),
+                engine_version,
+                build_if_missing,
+                build_runtime,
+                keep_build_artifacts,
+                non_interactive,
+            })?;
+            if let Some(format) = then_install {
+                install_native_package(
+                    &recipe,
+                    &recipe_path,
+                    &prepared.profile,
+                    &prepared.engine,
+                    &prepared.engine_root,
+                    format,
+                    destination,
+                    cache,
+                    &winetricks_command,
+                    wineforge_binary,
+                    launcher_binary,
+                    accept_license,
+                )?;
+            }
+        }
         Command::App { command } => match command {
             AppCommand::Create {
                 profile,
@@ -280,6 +435,37 @@ fn main() -> Result<()> {
                 &winetricks_command,
                 &winetricks,
             )?,
+            AppCommand::Import {
+                source_prefix,
+                recipe,
+                profile,
+                engine_manifest,
+                engine_root,
+                destination,
+                wineforge_binary,
+                launcher_binary,
+            } => {
+                let recipe_value = recipe::read(&recipe)?;
+                let profile_value = read_profile(&profile)?;
+                let engine = read_engine(&engine_manifest)?;
+                let current_executable =
+                    std::env::current_exe().context("failed to locate the Wineforge executable")?;
+                let wineforge_binary =
+                    wineforge_binary.unwrap_or_else(|| current_executable.clone());
+                let launcher_binary = launcher_binary
+                    .unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
+                native_package::import_macos_app(&native_package::ImportRequest {
+                    source_prefix: &source_prefix,
+                    recipe: &recipe_value,
+                    recipe_path: &recipe,
+                    profile: &profile_value,
+                    engine: &engine,
+                    engine_root: &engine_root,
+                    destination: &destination,
+                    wineforge_binary: &wineforge_binary,
+                    launcher_binary: &launcher_binary,
+                })?;
+            }
         },
         Command::Engine { command } => match command {
             EngineCommand::Prune {
@@ -385,29 +571,20 @@ fn main() -> Result<()> {
             let profile = read_profile(&profile_path)?;
             let engine = read_engine(&engine_manifest)?;
             let format = format.unwrap_or_else(native_package::host_default_format);
-            let destination = destination.map_or_else(
-                || native_package::default_destination(format, &recipe, &profile),
-                Ok,
-            )?;
-            let current_executable =
-                std::env::current_exe().context("failed to locate the Wineforge executable")?;
-            let wineforge_binary = wineforge_binary.unwrap_or_else(|| current_executable.clone());
-            let launcher_binary = launcher_binary
-                .unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
-            native_package::install(&native_package::InstallRequest {
-                recipe: &recipe,
-                recipe_path: &recipe_path,
-                profile: &profile,
-                engine: &engine,
-                engine_root: &engine_root,
-                destination: &destination,
+            install_native_package(
+                &recipe,
+                &recipe_path,
+                &profile,
+                &engine,
+                &engine_root,
                 format,
-                wineforge_binary: &wineforge_binary,
-                launcher_binary: &launcher_binary,
-                winetricks_command: &winetricks_command,
-                cache: &cache.map_or_else(default_source_cache, Ok)?,
+                destination,
+                cache,
+                &winetricks_command,
+                wineforge_binary,
+                launcher_binary,
                 accept_license,
-            })?;
+            )?;
         }
         Command::ValidateProfile { profile } => {
             let profile: ApplicationProfile = read_config(&profile)?;
@@ -519,6 +696,46 @@ fn default_source_cache() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(relative))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn install_native_package(
+    recipe: &recipe::Recipe,
+    recipe_path: &Path,
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+    format: native_package::NativeFormat,
+    destination: Option<PathBuf>,
+    cache: Option<PathBuf>,
+    winetricks_command: &Path,
+    wineforge_binary: Option<PathBuf>,
+    launcher_binary: Option<PathBuf>,
+    accept_license: bool,
+) -> Result<()> {
+    let destination = destination.map_or_else(
+        || native_package::default_destination(format, recipe, profile),
+        Ok,
+    )?;
+    let current_executable =
+        std::env::current_exe().context("failed to locate the Wineforge executable")?;
+    let wineforge_binary = wineforge_binary.unwrap_or_else(|| current_executable.clone());
+    let launcher_binary =
+        launcher_binary.unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
+    native_package::install(&native_package::InstallRequest {
+        recipe,
+        recipe_path,
+        profile,
+        engine,
+        engine_root,
+        destination: &destination,
+        format,
+        wineforge_binary: &wineforge_binary,
+        launcher_binary: &launcher_binary,
+        winetricks_command,
+        cache: &cache.map_or_else(default_source_cache, Ok)?,
+        accept_license,
+    })
+}
+
 fn read_profile(path: &Path) -> Result<ApplicationProfile> {
     let profile: ApplicationProfile = read_config(path)?;
     profile.validate().context("profile validation failed")?;
@@ -533,7 +750,11 @@ fn read_engine(path: &Path) -> Result<EngineManifest> {
     Ok(engine)
 }
 
-fn install_engine(archive: &Path, manifest: &EngineManifest, destination: &Path) -> Result<()> {
+pub(crate) fn install_engine(
+    archive: &Path,
+    manifest: &EngineManifest,
+    destination: &Path,
+) -> Result<()> {
     if destination.exists() {
         bail!("destination already exists: {}", destination.display());
     }
@@ -576,7 +797,9 @@ fn install_engine(archive: &Path, manifest: &EngineManifest, destination: &Path)
         id: manifest.id.clone(),
         artifact_sha256: Some(manifest.artifact.sha256.0.clone()),
     };
-    if let Err(error) = write_json(&destination.join(ENGINE_MARKER), &marker) {
+    if let Err(error) = write_engine_manifest(&destination.join("engine.toml"), manifest)
+        .and_then(|()| write_json(&destination.join(ENGINE_MARKER), &marker))
+    {
         let _ = fs::remove_dir_all(destination);
         return Err(error);
     }
@@ -592,6 +815,11 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_engine_manifest(path: &Path, manifest: &EngineManifest) -> Result<()> {
+    let text = toml::to_string_pretty(manifest)?;
+    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn prune_engines(
@@ -896,7 +1124,7 @@ fn validate_engine_selection(
     Ok(platform)
 }
 
-fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
+pub(crate) fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
     let resolved_root = resolved_engine_root(engine, engine_root)?;
     let canonical_root = fs::canonicalize(&resolved_root)
         .with_context(|| format!("invalid engine root: {}", engine_root.display()))?;
@@ -981,8 +1209,47 @@ fn add_wine_environment(
         command.env(key, value);
     }
     for (key, value) in &profile.environment.0 {
-        command.env(key, value);
+        let prefix = profile.prefix.to_string_lossy();
+        command.env(key, value.replace("${WINEFORGE_PREFIX}", &prefix));
     }
+}
+
+pub(crate) fn adopt_imported_instance(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+) -> Result<()> {
+    validate_engine_selection(profile, engine)?;
+    sanitize_prefix(&profile.prefix)?;
+    prepare_private_runtime(profile)?;
+    apply_profile(profile, true)?;
+    verify_host_exposure(profile)?;
+
+    let wine = engine_wine(engine, engine_root)?;
+    let mut wineboot = sandbox::command(profile, engine_root, &wine)?;
+    wineboot.args(["wineboot", "--update"]);
+    wineboot.current_dir(&profile.prefix);
+    add_wine_environment(&mut wineboot, profile, engine);
+    let status = wineboot
+        .status()
+        .context("failed to update imported Wine prefix")?;
+    if !status.success() {
+        bail!("imported Wine prefix update exited with {status}");
+    }
+
+    sanitize_prefix(&profile.prefix)?;
+    apply_profile(profile, true)?;
+    verify_host_exposure(profile)?;
+    write_json(
+        &profile.prefix.join(".wineforge").join(APP_INSTANCE_MARKER),
+        &ManagedEntry {
+            schema_version: 1,
+            kind: "app-instance".into(),
+            id: profile.id.clone(),
+            artifact_sha256: None,
+        },
+    )?;
+    shutdown_wineserver(profile, engine, engine_root)
 }
 
 fn prepare_private_runtime(profile: &ApplicationProfile) -> Result<()> {
@@ -1098,18 +1365,7 @@ fn create_app_instance(
 fn validate_winetricks_verbs(verbs: &[String]) -> Result<()> {
     let mut unique = BTreeSet::new();
     for verb in verbs {
-        let valid = !verb.is_empty()
-            && verb.len() <= 64
-            && verb
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            && verb.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'_' | b'-' | b'.')
-            });
-        if !valid {
+        if !recipe::is_safe_winetricks_verb(verb) {
             bail!("invalid Winetricks verb {verb:?}; options and commands are not accepted");
         }
         if !unique.insert(verb) {
@@ -1146,7 +1402,7 @@ fn provision_app(
     })?;
     // Wine and Winetricks may recreate host-facing convenience links even when
     // provisioning fails, so sanitization and exposure verification are unconditional.
-    sanitize_prefix(&profile.prefix)?;
+    sanitize_profile(profile)?;
     verify_host_exposure(profile)?;
     if !status.success() {
         bail!("Winetricks exited with {status}");
@@ -1197,13 +1453,45 @@ fn provision_app(
 }
 
 fn sanitize_prefix(prefix: &Path) -> Result<()> {
+    sanitize_prefix_with_allowed_mappings(prefix, &BTreeMap::new())
+}
+
+pub(crate) fn sanitize_profile(profile: &ApplicationProfile) -> Result<()> {
+    let allowed_mappings = profile
+        .mappings
+        .iter()
+        .filter_map(|mapping| {
+            mapping
+                .normalized_drive()
+                .map(|drive| (drive, &mapping.host_path))
+        })
+        .map(|(drive, host_path)| {
+            let canonical_host = fs::canonicalize(host_path)
+                .with_context(|| format!("invalid mapped host path: {}", host_path.display()))?;
+            Ok((
+                profile
+                    .prefix
+                    .join("dosdevices")
+                    .join(format!("{}:", drive.to_ascii_lowercase())),
+                canonical_host,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    sanitize_prefix_with_allowed_mappings(&profile.prefix, &allowed_mappings)
+}
+
+fn sanitize_prefix_with_allowed_mappings(
+    prefix: &Path,
+    allowed_mappings: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<()> {
     let users = prefix.join("drive_c/users");
     let inspection = inspect_prefix(prefix)?;
-    for finding in inspection
-        .symlinks
-        .iter()
-        .filter(|item| item.escapes_prefix)
-    {
+    for finding in inspection.symlinks.iter().filter(|item| {
+        item.escapes_prefix
+            && allowed_mappings
+                .get(&item.path)
+                .is_none_or(|target| target != &item.resolved_target)
+    }) {
         fs::remove_file(&finding.path).with_context(|| {
             format!(
                 "failed to remove host integration {}",
@@ -1222,7 +1510,12 @@ fn sanitize_prefix(prefix: &Path) -> Result<()> {
     let remaining = inspect_prefix(prefix)?
         .symlinks
         .into_iter()
-        .filter(|item| item.escapes_prefix)
+        .filter(|item| {
+            item.escapes_prefix
+                && allowed_mappings
+                    .get(&item.path)
+                    .is_none_or(|target| target != &item.resolved_target)
+        })
         .map(|item| item.path)
         .collect::<Vec<_>>();
     if !remaining.is_empty() {
@@ -1323,7 +1616,7 @@ fn current_platform() -> Result<Platform> {
     bail!("this host platform is not currently supported")
 }
 
-fn rosetta_available() -> bool {
+pub(crate) fn rosetta_available() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     return Path::new("/Library/Apple/usr/share/rosetta/rosetta").exists();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1523,8 +1816,17 @@ mod tests {
 
     #[test]
     fn manual_winetricks_rejects_options_and_duplicates() {
-        assert!(validate_winetricks_verbs(&["corefonts".into(), "vcrun2022".into()]).is_ok());
+        assert!(
+            validate_winetricks_verbs(&[
+                "corefonts".into(),
+                "vcrun2022".into(),
+                "fontsmooth=rgb".into(),
+            ])
+            .is_ok()
+        );
         assert!(validate_winetricks_verbs(&["--force".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["fontsmooth=".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["fontsmooth=rgb=extra".into()]).is_err());
         assert!(validate_winetricks_verbs(&["corefonts".into(), "corefonts".into()]).is_err());
         assert!(validate_winetricks_verbs(&["CoreFonts".into()]).is_err());
     }
@@ -1550,6 +1852,46 @@ mod tests {
         let ambiguous = temp.path().join("profile.conf");
         fs::write(&ambiguous, "schema_version = 1").unwrap();
         assert!(read_config::<ApplicationProfile>(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn prepare_second_stage_is_explicit_and_typed() {
+        let cli = Cli::try_parse_from([
+            "wineforge",
+            "prepare",
+            "recipe.toml",
+            "--profile-out",
+            "profile.toml",
+            "--then-install",
+            "app",
+            "--destination",
+            "/tmp/Example.app",
+            "--non-interactive",
+        ])
+        .unwrap();
+        let Command::Prepare {
+            then_install,
+            destination,
+            ..
+        } = cli.command
+        else {
+            panic!("prepare command was not parsed");
+        };
+        assert_eq!(then_install, Some(native_package::NativeFormat::App));
+        assert_eq!(destination, Some(PathBuf::from("/tmp/Example.app")));
+
+        assert!(
+            Cli::try_parse_from([
+                "wineforge",
+                "prepare",
+                "recipe.toml",
+                "--profile-out",
+                "profile.toml",
+                "--destination",
+                "/tmp/Example.app",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1588,6 +1930,12 @@ mod tests {
         let destination = temp.path().join("installed");
         install_engine(&archive_path, &manifest(digest), &destination).unwrap();
         assert!(destination.join("wineforge-engine/bin/wine").is_file());
+        assert_eq!(
+            read_config::<EngineManifest>(&destination.join("engine.toml"))
+                .unwrap()
+                .id,
+            "example-engine-macos-x86_64"
+        );
         let marker: ManagedEntry = read_json(&destination.join(ENGINE_MARKER)).unwrap();
         assert_eq!(marker.kind, "engine");
         assert_eq!(marker.id, "example-engine-macos-x86_64");
@@ -1648,6 +1996,42 @@ mod tests {
                 .iter()
                 .all(|finding| !finding.escapes_prefix)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_sanitization_preserves_only_the_exact_declared_mapping() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let allowed = temp.path().join("allowed");
+        let other = temp.path().join("other");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&other).unwrap();
+        let mapping = prefix.join("dosdevices/s:");
+        symlink(&allowed, &mapping).unwrap();
+        symlink("/", prefix.join("dosdevices/z:")).unwrap();
+        let mut value = profile(&prefix);
+        value.mappings.push(wineforge_core::HostMapping {
+            drive: "S".into(),
+            host_path: allowed,
+            access: MappingAccess::ReadWrite,
+        });
+
+        sanitize_profile(&value).unwrap();
+
+        assert_eq!(
+            fs::read_link(&mapping).unwrap(),
+            value.mappings[0].host_path
+        );
+        assert!(!prefix.join("dosdevices/z:").exists());
+
+        fs::remove_file(&mapping).unwrap();
+        symlink(other, &mapping).unwrap();
+        sanitize_profile(&value).unwrap();
+        assert!(!mapping.exists());
     }
 
     #[cfg(unix)]

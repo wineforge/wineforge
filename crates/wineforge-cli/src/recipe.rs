@@ -320,18 +320,7 @@ impl Recipe {
                 }
                 let mut unique = BTreeSet::new();
                 for verb in verbs {
-                    let valid = verb.len() <= 64
-                        && !verb.is_empty()
-                        && verb
-                            .as_bytes()
-                            .first()
-                            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-                        && verb.bytes().all(|byte| {
-                            byte.is_ascii_lowercase()
-                                || byte.is_ascii_digit()
-                                || matches!(byte, b'_' | b'-' | b'.')
-                        });
-                    if !valid {
+                    if !is_safe_winetricks_verb(verb) {
                         bail!("invalid Winetricks recipe verb {verb:?}");
                     }
                     if !unique.insert(verb) {
@@ -356,6 +345,31 @@ impl Recipe {
             .iter()
             .map(|source| (source.id(), source))
             .collect()
+    }
+}
+
+pub(crate) fn is_safe_winetricks_verb(verb: &str) -> bool {
+    fn valid_component(component: &str) -> bool {
+        !component.is_empty()
+            && component
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+    }
+
+    if verb.len() > 64 {
+        return false;
+    }
+    match verb.split_once('=') {
+        Some((name, value)) => {
+            !value.contains('=') && valid_component(name) && valid_component(value)
+        }
+        None => valid_component(verb),
     }
 }
 

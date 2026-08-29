@@ -68,6 +68,26 @@ wineforge recipe inspect recipe.toml
 wineforge recipe inspect-nupkg package.nupkg \
   --package-id PACKAGE_ID --package-version PACKAGE_VERSION
 
+# Guided preparation: generate a local TOML profile, reuse a compatible managed
+# engine when present, or build and install one from a trusted engines checkout.
+# Successful local builds discard their archive and work tree by default.
+wineforge prepare recipe.toml \
+  --profile-out profile.toml \
+  --engine-store /absolute/engine/store \
+  --engine-builder /absolute/wineforge-engines \
+  --build-if-missing
+
+# The optional second stage feeds the generated profile and resolved engine into
+# the unchanged native-package installer.
+cargo build --release --bins
+wineforge prepare recipe.toml \
+  --profile-out profile.toml \
+  --engine-store /absolute/engine/store \
+  --engine-builder /absolute/wineforge-engines \
+  --build-if-missing \
+  --then-install app \
+  --destination "$HOME/Applications/Wineforge/Example.app"
+
 # Install into the fresh prefix named by the profile. This refuses an existing
 # prefix and removes the new prefix if any installation or postcondition fails.
 wineforge recipe install recipe.toml \
@@ -130,6 +150,15 @@ wineforge run profile.toml \
 
 `--engine-root` accepts either the destination passed to `install-engine` or
 its contained `wineforge-engine` directory.
+
+`prepare` selects the single recipe variant matching the current host, resolves
+the newest compatible semantic engine version, and never executes build commands
+from recipe data. Only the fixed `scripts/build-local.sh` interface in the
+explicitly supplied trusted builder checkout may be invoked. Linux builds use
+Podman or Docker; macOS builds are native and re-execute under Rosetta when
+needed. Repeat `--mapping DRIVE=read-only|read-write=/absolute/path` to provide
+non-interactive host access. Use `--keep-build-artifacts` to retain successful
+build output; failed builds remain governed by the builder's diagnostic cleanup.
 
 Pruning only recognizes immediate child directories containing Wineforge's
 management marker; unrelated files and unmarked directories are ignored. Pass
@@ -231,6 +260,26 @@ Because package-owned files are immutable, the launcher copies its verified
 prefix template to `$XDG_DATA_HOME/wineforge/instances/ID` (or
 `$HOME/.local/share/wineforge/instances/ID`) on first launch. Removing the
 package leaves that user data intact, matching normal Linux package behavior.
+
+An existing prefix can be cloned into the same managed macOS layout without
+rerunning its installer:
+
+```sh
+wineforge app import /absolute/source/prefix \
+  --recipe recipe.toml \
+  --profile profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/root \
+  --destination /absolute/Application.app
+```
+
+Import never modifies the source prefix. It copies registry and application
+state, drops host-facing links during the copy, updates the clone with the
+selected engine, reapplies declared mappings, and commits the destination only
+after the final exposure audit succeeds. The recipe is retained as package
+metadata; its installation actions are not executed during import. Prefixes
+can contain credentials or license state, so imported bundles are private user
+data and must not be redistributed blindly.
 
 Packages currently embed their engines for independent removal and portability.
 This deliberately trades disk space for a package that cannot break when a

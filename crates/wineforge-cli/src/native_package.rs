@@ -14,7 +14,7 @@ use serde::Serialize;
 use wineforge_core::{ApplicationProfile, EngineManifest};
 
 use crate::recipe::{Recipe, windows_path_to_prefix};
-use crate::{recipe_executor, resolved_engine_root, shutdown_wineserver};
+use crate::{adopt_imported_instance, recipe_executor, resolved_engine_root, shutdown_wineserver};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum NativeFormat {
@@ -35,6 +35,18 @@ pub struct InstallRequest<'a> {
     pub winetricks_command: &'a Path,
     pub cache: &'a Path,
     pub accept_license: bool,
+}
+
+pub struct ImportRequest<'a> {
+    pub source_prefix: &'a Path,
+    pub recipe: &'a Recipe,
+    pub recipe_path: &'a Path,
+    pub profile: &'a ApplicationProfile,
+    pub engine: &'a EngineManifest,
+    pub engine_root: &'a Path,
+    pub destination: &'a Path,
+    pub wineforge_binary: &'a Path,
+    pub launcher_binary: &'a Path,
 }
 
 pub fn host_default_format() -> NativeFormat {
@@ -79,6 +91,87 @@ pub fn install(request: &InstallRequest<'_>) -> Result<()> {
         NativeFormat::App => install_macos_app(request),
         NativeFormat::Deb => build_debian_package(request),
     }
+}
+
+pub fn import_macos_app(request: &ImportRequest<'_>) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("macOS application bundles must be imported on macOS");
+    }
+    require_real_directory(request.source_prefix, "source Wine prefix")?;
+    require_regular_file(request.wineforge_binary, "Wineforge executable")?;
+    require_regular_file(request.launcher_binary, "Wineforge native launcher")?;
+    if !request.destination.is_absolute()
+        || request.destination.extension() != Some(OsStr::new("app"))
+    {
+        bail!("macOS application destination must be an absolute .app path");
+    }
+    if fs::symlink_metadata(request.destination).is_ok() {
+        bail!(
+            "native package destination already exists: {}",
+            request.destination.display()
+        );
+    }
+    let parent = request
+        .destination
+        .parent()
+        .context("application destination has no parent directory")?;
+    ensure_real_directory(parent)?;
+    let staging = staging_path(request.destination)?;
+    fs::create_dir(&staging)?;
+    let result = (|| -> Result<()> {
+        let contents = staging.join("Contents");
+        let macos = contents.join("MacOS");
+        let resources = contents.join("Resources");
+        let engine_destination = contents.join("Frameworks/WineEngine");
+        let prefix_destination = contents.join("WinePrefix");
+        fs::create_dir_all(&macos)?;
+        fs::create_dir_all(&resources)?;
+        fs::create_dir_all(contents.join("Frameworks"))?;
+        copy_executable(request.wineforge_binary, &macos.join("wineforge"))?;
+        copy_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
+        copy_tree(
+            &resolved_engine_root(request.engine, request.engine_root)?,
+            &engine_destination,
+        )?;
+        copy_imported_prefix(request.source_prefix, &prefix_destination)?;
+
+        let mut imported_profile = request.profile.clone();
+        imported_profile.prefix = prefix_destination.clone();
+        adopt_imported_instance(&imported_profile, request.engine, &engine_destination)?;
+
+        let executable =
+            windows_path_to_prefix(&imported_profile.prefix, &imported_profile.executable)?;
+        write_icon_assets(
+            &executable,
+            &resources.join("AppIcon.png"),
+            Some(&resources.join("AppIcon.icns")),
+        )?;
+        let mut final_profile = request.profile.clone();
+        final_profile.prefix = request.destination.join("Contents/WinePrefix");
+        write_toml(&resources.join("profile.toml"), &final_profile)?;
+        write_toml(&resources.join("engine.toml"), request.engine)?;
+        copy_regular_file(request.recipe_path, &resources.join("recipe.toml"))?;
+        fs::write(
+            contents.join("Info.plist"),
+            macos_info_plist(request.recipe, request.profile),
+        )?;
+        fs::rename(&staging, request.destination).with_context(|| {
+            format!(
+                "failed to commit imported macOS application {}",
+                request.destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+    println!(
+        "imported macOS application {}",
+        request.destination.display()
+    );
+    Ok(())
 }
 
 fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
@@ -195,19 +288,23 @@ fn build_debian_package(request: &InstallRequest<'_>) -> Result<()> {
 
         let mut install_profile = request.profile.clone();
         install_profile.prefix = prefix_template.clone();
+        let mut provisioning_profile = install_profile.clone();
+        provisioning_profile.mappings.clear();
         recipe_executor::install(
             request.recipe,
             request.recipe_path,
-            &install_profile,
+            &provisioning_profile,
             request.engine,
             request.engine_root,
             request.winetricks_command,
             request.cache,
             request.accept_license,
         )?;
-        shutdown_wineserver(&install_profile, request.engine, request.engine_root)?;
-        let executable =
-            windows_path_to_prefix(&install_profile.prefix, &install_profile.executable)?;
+        shutdown_wineserver(&provisioning_profile, request.engine, request.engine_root)?;
+        let executable = windows_path_to_prefix(
+            &provisioning_profile.prefix,
+            &provisioning_profile.executable,
+        )?;
         write_icon_assets(&executable, &resources.join("AppIcon.png"), None)?;
         write_toml(&resources.join("profile.toml"), &install_profile)?;
         write_toml(&resources.join("engine.toml"), request.engine)?;
@@ -359,24 +456,7 @@ fn debian_control(
 }
 
 fn write_icon_assets(executable: &Path, png: &Path, icns: Option<&Path>) -> Result<()> {
-    let images = extract_pe_icons(executable).unwrap_or_default();
-    let mut images = if images.is_empty() {
-        vec![fallback_icon(256)]
-    } else {
-        images
-    };
-    if images
-        .iter()
-        .map(ico::IconImage::width)
-        .max()
-        .is_some_and(|width| width < 256)
-    {
-        let largest = images
-            .iter()
-            .max_by_key(|image| image.width() * image.height())
-            .context("icon image selection unexpectedly failed")?;
-        images.push(resize_icon_nearest(largest, 256));
-    }
+    let images = prepare_icon_images(extract_pe_icons(executable).unwrap_or_default());
     let largest = images
         .iter()
         .max_by_key(|image| image.width() * image.height())
@@ -410,6 +490,48 @@ fn write_icon_assets(executable: &Path, png: &Path, icns: Option<&Path>) -> Resu
         family.write(File::create(path)?)?;
     }
     Ok(())
+}
+
+fn prepare_icon_images(images: Vec<ico::IconImage>) -> Vec<ico::IconImage> {
+    if images.is_empty() {
+        return vec![fallback_icon(256)];
+    }
+
+    let largest = images
+        .iter()
+        .max_by_key(|image| image.width() * image.height())
+        .expect("non-empty icon collection has a largest image");
+    let largest_square = pad_icon_to_square(largest);
+    let mut prepared = images
+        .into_iter()
+        .filter(|image| {
+            image.width() == image.height()
+                && matches!(image.width(), 16 | 32 | 48 | 128 | 256 | 512 | 1024)
+        })
+        .collect::<Vec<_>>();
+    if !prepared.iter().any(|image| image.width() == 256) {
+        prepared.push(resize_icon_nearest(&largest_square, 256));
+    }
+    prepared
+}
+
+fn pad_icon_to_square(source: &ico::IconImage) -> ico::IconImage {
+    // Windows icons commonly fill their bitmap, while macOS app icons need
+    // transparent breathing room around the artwork to match Finder's visual scale.
+    let content_size = source.width().max(source.height());
+    let size = content_size.saturating_mul(5).div_ceil(4);
+    let x_offset = (size - source.width()) / 2;
+    let y_offset = (size - source.height()) / 2;
+    let mut rgba = vec![0_u8; (size * size * 4) as usize];
+    for y in 0..source.height() {
+        let source_start = (y * source.width() * 4) as usize;
+        let source_end = source_start + (source.width() * 4) as usize;
+        let destination_start = (((y + y_offset) * size + x_offset) * 4) as usize;
+        let destination_end = destination_start + (source.width() * 4) as usize;
+        rgba[destination_start..destination_end]
+            .copy_from_slice(&source.rgba_data()[source_start..source_end]);
+    }
+    ico::IconImage::from_rgba_data(size, size, rgba)
 }
 
 fn extract_pe_icons(executable: &Path) -> Result<Vec<ico::IconImage>> {
@@ -523,6 +645,56 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
         let _ = fs::remove_dir_all(destination);
     }
     result
+}
+
+fn copy_imported_prefix(source: &Path, destination: &Path) -> Result<()> {
+    require_real_directory(source, "source Wine prefix")?;
+    if fs::symlink_metadata(destination).is_ok() {
+        bail!(
+            "prefix destination already exists: {}",
+            destination.display()
+        );
+    }
+    fs::create_dir(destination)?;
+    let result = copy_imported_prefix_contents(source, source, destination);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
+}
+
+fn copy_imported_prefix_contents(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::create_dir(&destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+            copy_imported_prefix_contents(root, &source_path, &destination_path)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&source_path)?;
+            if relative_link_stays_in_root(root, &source_path, &target) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, destination_path)?;
+                #[cfg(not(unix))]
+                bail!("prefix links are unsupported on this platform");
+            } else if source_path.starts_with(root.join("drive_c/users")) {
+                fs::create_dir(&destination_path)?;
+            }
+        } else {
+            bail!(
+                "source prefix contains a special file: {}",
+                source_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn copy_tree_contents(root: &Path, source: &Path, destination: &Path) -> Result<()> {
@@ -770,8 +942,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use wineforge_core::{
-        Artifact, ArtifactSource, EngineSelection, Environment, IsolationMode, IsolationPolicy,
-        Platform, Sha256Digest, Translation,
+        Artifact, ArtifactSource, EngineSelection, Environment, HostMapping, IsolationMode,
+        IsolationPolicy, MappingAccess, Platform, Sha256Digest, Translation,
     };
     use zip::write::SimpleFileOptions;
 
@@ -795,6 +967,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_non_square_pe_icon_is_normalized_for_native_packages() {
+        let malformed = ico::IconImage::from_rgba_data(265, 256, vec![255; 265 * 256 * 4]);
+        let small = ico::IconImage::from_rgba_data(32, 32, vec![127; 32 * 32 * 4]);
+
+        let prepared = prepare_icon_images(vec![small, malformed]);
+
+        assert!(prepared.iter().all(|image| image.width() == image.height()));
+        let normalized = prepared
+            .iter()
+            .find(|image| image.width() == 256)
+            .expect("a native-size icon is synthesized");
+        assert_eq!(normalized.rgba_data()[3], 0);
+        assert_eq!(normalized.rgba_data()[(128 * 256 + 128) * 4 + 3], 255);
+    }
+
+    #[test]
     fn internal_links_are_allowed_but_escaping_links_are_rejected() {
         let root = Path::new("/tmp/engine");
         assert!(relative_link_stays_in_root(
@@ -807,6 +995,36 @@ mod tests {
             &root.join("link"),
             Path::new("../outside")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_prefix_copy_preserves_internal_links_and_drops_host_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let user = source.join("drive_c/users/example");
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir(source.join("dosdevices")).unwrap();
+        fs::write(source.join("system.reg"), b"registry").unwrap();
+        symlink("../drive_c", source.join("dosdevices/c:")).unwrap();
+        symlink("/", source.join("dosdevices/z:")).unwrap();
+        symlink(temp.path(), user.join("Documents")).unwrap();
+
+        copy_imported_prefix(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_link(destination.join("dosdevices/c:")).unwrap(),
+            PathBuf::from("../drive_c")
+        );
+        assert!(!destination.join("dosdevices/z:").exists());
+        assert!(destination.join("drive_c/users/example/Documents").is_dir());
+        assert_eq!(
+            fs::read(destination.join("system.reg")).unwrap(),
+            b"registry"
+        );
     }
 
     #[test]
@@ -919,6 +1137,8 @@ mod tests {
             }],
         };
         fs::write(&recipe_path, toml::to_string_pretty(&recipe).unwrap()).unwrap();
+        let shared_directory = temp.path().join("shared");
+        fs::create_dir(&shared_directory).unwrap();
         let profile = ApplicationProfile {
             schema_version: 1,
             id: "org.example.packaged-app".into(),
@@ -933,7 +1153,11 @@ mod tests {
                 },
             )]),
             environment: Environment::default(),
-            mappings: Vec::new(),
+            mappings: vec![HostMapping {
+                drive: "S".into(),
+                host_path: shared_directory.clone(),
+                access: MappingAccess::ReadWrite,
+            }],
             isolation: IsolationPolicy {
                 mode: IsolationMode::Disabled,
             },
@@ -969,6 +1193,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(bundled.prefix, app.join("Contents/WinePrefix"));
+            assert_eq!(
+                fs::read_link(app.join("Contents/WinePrefix/dosdevices/s:")).unwrap(),
+                shared_directory
+            );
         }
 
         #[cfg(target_os = "linux")]
