@@ -46,6 +46,39 @@ crates/wineforge-core  schemas, validation, inspection and planning
 crates/wineforge-cli   command-line interface
 ```
 
+## Installation
+
+Build and install from crates.io:
+
+```sh
+cargo install wineforge-cli --locked
+```
+
+Or install the matching prebuilt GitHub release without using a third-party
+binary host:
+
+```sh
+cargo binstall wineforge-cli
+```
+
+Both methods install the `wineforge` command and its `wineforge-launcher`
+companion. Prebuilt archives are provided for Apple Silicon and Intel macOS and
+x86-64 Linux. Other Rust targets fall back to compilation from crates.io.
+
+## Maintainer releases
+
+Crate publication is deliberately manual. Configure the protected `crates-io`
+GitHub environment with a `CARGO_REGISTRY_TOKEN` secret, then run the `Publish
+crate` workflow from `main` for `wineforge-core` followed by `wineforge-cli`.
+The CLI publication succeeds only after crates.io has indexed the matching core
+version.
+
+Pushing a `vVERSION` tag whose version exactly matches `wineforge-cli` and whose
+commit is contained in `main` builds an immutable GitHub release. It contains
+ad-hoc-signed archives for both macOS architectures and an x86-64 Linux archive,
+plus SHA-256 sidecars. Those archive names match the explicit cargo-binstall
+metadata. The workflow refuses to replace an existing release.
+
 ## Development
 
 ```sh

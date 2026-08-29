@@ -27,5 +27,5 @@ tar = "0.4"
 thiserror = "2.0"
 toml = "0.8"
 url = { version = "2.5", features = ["serde"] }
-wineforge-core = { path = "crates/wineforge-core" }
+wineforge-core = { path = "crates/wineforge-core", version = "0.1.0" }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
