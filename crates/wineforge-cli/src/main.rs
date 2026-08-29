@@ -139,6 +139,28 @@ enum AppCommand {
         #[arg(long, default_value = "winetricks")]
         winetricks_command: PathBuf,
     },
+    /// Package a cloned existing Wine prefix as a managed macOS application.
+    Import {
+        /// Existing prefix to clone. The source is never modified.
+        source_prefix: PathBuf,
+        #[arg(long)]
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+        #[arg(long)]
+        engine_root: PathBuf,
+        /// Final .app directory.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Wineforge executable embedded in the package. Defaults to this executable.
+        #[arg(long)]
+        wineforge_binary: Option<PathBuf>,
+        /// Generic native launcher embedded in the package. Defaults to a sibling binary.
+        #[arg(long)]
+        launcher_binary: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -280,6 +302,37 @@ fn main() -> Result<()> {
                 &winetricks_command,
                 &winetricks,
             )?,
+            AppCommand::Import {
+                source_prefix,
+                recipe,
+                profile,
+                engine_manifest,
+                engine_root,
+                destination,
+                wineforge_binary,
+                launcher_binary,
+            } => {
+                let recipe_value = recipe::read(&recipe)?;
+                let profile_value = read_profile(&profile)?;
+                let engine = read_engine(&engine_manifest)?;
+                let current_executable =
+                    std::env::current_exe().context("failed to locate the Wineforge executable")?;
+                let wineforge_binary =
+                    wineforge_binary.unwrap_or_else(|| current_executable.clone());
+                let launcher_binary = launcher_binary
+                    .unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
+                native_package::import_macos_app(&native_package::ImportRequest {
+                    source_prefix: &source_prefix,
+                    recipe: &recipe_value,
+                    recipe_path: &recipe,
+                    profile: &profile_value,
+                    engine: &engine,
+                    engine_root: &engine_root,
+                    destination: &destination,
+                    wineforge_binary: &wineforge_binary,
+                    launcher_binary: &launcher_binary,
+                })?;
+            }
         },
         Command::Engine { command } => match command {
             EngineCommand::Prune {
@@ -981,8 +1034,47 @@ fn add_wine_environment(
         command.env(key, value);
     }
     for (key, value) in &profile.environment.0 {
-        command.env(key, value);
+        let prefix = profile.prefix.to_string_lossy();
+        command.env(key, value.replace("${WINEFORGE_PREFIX}", &prefix));
     }
+}
+
+pub(crate) fn adopt_imported_instance(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+) -> Result<()> {
+    validate_engine_selection(profile, engine)?;
+    sanitize_prefix(&profile.prefix)?;
+    prepare_private_runtime(profile)?;
+    apply_profile(profile, true)?;
+    verify_host_exposure(profile)?;
+
+    let wine = engine_wine(engine, engine_root)?;
+    let mut wineboot = sandbox::command(profile, engine_root, &wine)?;
+    wineboot.args(["wineboot", "--update"]);
+    wineboot.current_dir(&profile.prefix);
+    add_wine_environment(&mut wineboot, profile, engine);
+    let status = wineboot
+        .status()
+        .context("failed to update imported Wine prefix")?;
+    if !status.success() {
+        bail!("imported Wine prefix update exited with {status}");
+    }
+
+    sanitize_prefix(&profile.prefix)?;
+    apply_profile(profile, true)?;
+    verify_host_exposure(profile)?;
+    write_json(
+        &profile.prefix.join(".wineforge").join(APP_INSTANCE_MARKER),
+        &ManagedEntry {
+            schema_version: 1,
+            kind: "app-instance".into(),
+            id: profile.id.clone(),
+            artifact_sha256: None,
+        },
+    )?;
+    shutdown_wineserver(profile, engine, engine_root)
 }
 
 fn prepare_private_runtime(profile: &ApplicationProfile) -> Result<()> {

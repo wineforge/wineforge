@@ -14,7 +14,7 @@ use serde::Serialize;
 use wineforge_core::{ApplicationProfile, EngineManifest};
 
 use crate::recipe::{Recipe, windows_path_to_prefix};
-use crate::{recipe_executor, resolved_engine_root, shutdown_wineserver};
+use crate::{adopt_imported_instance, recipe_executor, resolved_engine_root, shutdown_wineserver};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum NativeFormat {
@@ -35,6 +35,18 @@ pub struct InstallRequest<'a> {
     pub winetricks_command: &'a Path,
     pub cache: &'a Path,
     pub accept_license: bool,
+}
+
+pub struct ImportRequest<'a> {
+    pub source_prefix: &'a Path,
+    pub recipe: &'a Recipe,
+    pub recipe_path: &'a Path,
+    pub profile: &'a ApplicationProfile,
+    pub engine: &'a EngineManifest,
+    pub engine_root: &'a Path,
+    pub destination: &'a Path,
+    pub wineforge_binary: &'a Path,
+    pub launcher_binary: &'a Path,
 }
 
 pub fn host_default_format() -> NativeFormat {
@@ -79,6 +91,87 @@ pub fn install(request: &InstallRequest<'_>) -> Result<()> {
         NativeFormat::App => install_macos_app(request),
         NativeFormat::Deb => build_debian_package(request),
     }
+}
+
+pub fn import_macos_app(request: &ImportRequest<'_>) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("macOS application bundles must be imported on macOS");
+    }
+    require_real_directory(request.source_prefix, "source Wine prefix")?;
+    require_regular_file(request.wineforge_binary, "Wineforge executable")?;
+    require_regular_file(request.launcher_binary, "Wineforge native launcher")?;
+    if !request.destination.is_absolute()
+        || request.destination.extension() != Some(OsStr::new("app"))
+    {
+        bail!("macOS application destination must be an absolute .app path");
+    }
+    if fs::symlink_metadata(request.destination).is_ok() {
+        bail!(
+            "native package destination already exists: {}",
+            request.destination.display()
+        );
+    }
+    let parent = request
+        .destination
+        .parent()
+        .context("application destination has no parent directory")?;
+    ensure_real_directory(parent)?;
+    let staging = staging_path(request.destination)?;
+    fs::create_dir(&staging)?;
+    let result = (|| -> Result<()> {
+        let contents = staging.join("Contents");
+        let macos = contents.join("MacOS");
+        let resources = contents.join("Resources");
+        let engine_destination = contents.join("Frameworks/WineEngine");
+        let prefix_destination = contents.join("WinePrefix");
+        fs::create_dir_all(&macos)?;
+        fs::create_dir_all(&resources)?;
+        fs::create_dir_all(contents.join("Frameworks"))?;
+        copy_executable(request.wineforge_binary, &macos.join("wineforge"))?;
+        copy_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
+        copy_tree(
+            &resolved_engine_root(request.engine, request.engine_root)?,
+            &engine_destination,
+        )?;
+        copy_imported_prefix(request.source_prefix, &prefix_destination)?;
+
+        let mut imported_profile = request.profile.clone();
+        imported_profile.prefix = prefix_destination.clone();
+        adopt_imported_instance(&imported_profile, request.engine, &engine_destination)?;
+
+        let executable =
+            windows_path_to_prefix(&imported_profile.prefix, &imported_profile.executable)?;
+        write_icon_assets(
+            &executable,
+            &resources.join("AppIcon.png"),
+            Some(&resources.join("AppIcon.icns")),
+        )?;
+        let mut final_profile = request.profile.clone();
+        final_profile.prefix = request.destination.join("Contents/WinePrefix");
+        write_toml(&resources.join("profile.toml"), &final_profile)?;
+        write_toml(&resources.join("engine.toml"), request.engine)?;
+        copy_regular_file(request.recipe_path, &resources.join("recipe.toml"))?;
+        fs::write(
+            contents.join("Info.plist"),
+            macos_info_plist(request.recipe, request.profile),
+        )?;
+        fs::rename(&staging, request.destination).with_context(|| {
+            format!(
+                "failed to commit imported macOS application {}",
+                request.destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+    println!(
+        "imported macOS application {}",
+        request.destination.display()
+    );
+    Ok(())
 }
 
 fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
@@ -525,6 +618,56 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     result
 }
 
+fn copy_imported_prefix(source: &Path, destination: &Path) -> Result<()> {
+    require_real_directory(source, "source Wine prefix")?;
+    if fs::symlink_metadata(destination).is_ok() {
+        bail!(
+            "prefix destination already exists: {}",
+            destination.display()
+        );
+    }
+    fs::create_dir(destination)?;
+    let result = copy_imported_prefix_contents(source, source, destination);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
+}
+
+fn copy_imported_prefix_contents(root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::create_dir(&destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+            copy_imported_prefix_contents(root, &source_path, &destination_path)?;
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&source_path)?;
+            if relative_link_stays_in_root(root, &source_path, &target) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, destination_path)?;
+                #[cfg(not(unix))]
+                bail!("prefix links are unsupported on this platform");
+            } else if source_path.starts_with(root.join("drive_c/users")) {
+                fs::create_dir(&destination_path)?;
+            }
+        } else {
+            bail!(
+                "source prefix contains a special file: {}",
+                source_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn copy_tree_contents(root: &Path, source: &Path, destination: &Path) -> Result<()> {
     let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -807,6 +950,36 @@ mod tests {
             &root.join("link"),
             Path::new("../outside")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_prefix_copy_preserves_internal_links_and_drops_host_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let user = source.join("drive_c/users/example");
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir(source.join("dosdevices")).unwrap();
+        fs::write(source.join("system.reg"), b"registry").unwrap();
+        symlink("../drive_c", source.join("dosdevices/c:")).unwrap();
+        symlink("/", source.join("dosdevices/z:")).unwrap();
+        symlink(temp.path(), user.join("Documents")).unwrap();
+
+        copy_imported_prefix(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_link(destination.join("dosdevices/c:")).unwrap(),
+            PathBuf::from("../drive_c")
+        );
+        assert!(!destination.join("dosdevices/z:").exists());
+        assert!(destination.join("drive_c/users/example/Documents").is_dir());
+        assert_eq!(
+            fs::read(destination.join("system.reg")).unwrap(),
+            b"registry"
+        );
     }
 
     #[test]

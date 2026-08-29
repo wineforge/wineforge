@@ -232,6 +232,26 @@ prefix template to `$XDG_DATA_HOME/wineforge/instances/ID` (or
 `$HOME/.local/share/wineforge/instances/ID`) on first launch. Removing the
 package leaves that user data intact, matching normal Linux package behavior.
 
+An existing prefix can be cloned into the same managed macOS layout without
+rerunning its installer:
+
+```sh
+wineforge app import /absolute/source/prefix \
+  --recipe recipe.toml \
+  --profile profile.toml \
+  --engine-manifest engine.toml \
+  --engine-root /absolute/engine/root \
+  --destination /absolute/Application.app
+```
+
+Import never modifies the source prefix. It copies registry and application
+state, drops host-facing links during the copy, updates the clone with the
+selected engine, reapplies declared mappings, and commits the destination only
+after the final exposure audit succeeds. The recipe is retained as package
+metadata; its installation actions are not executed during import. Prefixes
+can contain credentials or license state, so imported bundles are private user
+data and must not be redistributed blindly.
+
 Packages currently embed their engines for independent removal and portability.
 This deliberately trades disk space for a package that cannot break when a
 shared engine is pruned. Generated packages are local and unsigned; platform
