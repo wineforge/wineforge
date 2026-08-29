@@ -1365,18 +1365,7 @@ fn create_app_instance(
 fn validate_winetricks_verbs(verbs: &[String]) -> Result<()> {
     let mut unique = BTreeSet::new();
     for verb in verbs {
-        let valid = !verb.is_empty()
-            && verb.len() <= 64
-            && verb
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            && verb.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'_' | b'-' | b'.')
-            });
-        if !valid {
+        if !recipe::is_safe_winetricks_verb(verb) {
             bail!("invalid Winetricks verb {verb:?}; options and commands are not accepted");
         }
         if !unique.insert(verb) {
@@ -1827,8 +1816,17 @@ mod tests {
 
     #[test]
     fn manual_winetricks_rejects_options_and_duplicates() {
-        assert!(validate_winetricks_verbs(&["corefonts".into(), "vcrun2022".into()]).is_ok());
+        assert!(
+            validate_winetricks_verbs(&[
+                "corefonts".into(),
+                "vcrun2022".into(),
+                "fontsmooth=rgb".into(),
+            ])
+            .is_ok()
+        );
         assert!(validate_winetricks_verbs(&["--force".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["fontsmooth=".into()]).is_err());
+        assert!(validate_winetricks_verbs(&["fontsmooth=rgb=extra".into()]).is_err());
         assert!(validate_winetricks_verbs(&["corefonts".into(), "corefonts".into()]).is_err());
         assert!(validate_winetricks_verbs(&["CoreFonts".into()]).is_err());
     }
