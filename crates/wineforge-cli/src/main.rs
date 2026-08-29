@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -1413,7 +1413,7 @@ fn provision_app(
     })?;
     // Wine and Winetricks may recreate host-facing convenience links even when
     // provisioning fails, so sanitization and exposure verification are unconditional.
-    sanitize_prefix(&profile.prefix)?;
+    sanitize_profile(profile)?;
     verify_host_exposure(profile)?;
     if !status.success() {
         bail!("Winetricks exited with {status}");
@@ -1464,13 +1464,45 @@ fn provision_app(
 }
 
 fn sanitize_prefix(prefix: &Path) -> Result<()> {
+    sanitize_prefix_with_allowed_mappings(prefix, &BTreeMap::new())
+}
+
+pub(crate) fn sanitize_profile(profile: &ApplicationProfile) -> Result<()> {
+    let allowed_mappings = profile
+        .mappings
+        .iter()
+        .filter_map(|mapping| {
+            mapping
+                .normalized_drive()
+                .map(|drive| (drive, &mapping.host_path))
+        })
+        .map(|(drive, host_path)| {
+            let canonical_host = fs::canonicalize(host_path)
+                .with_context(|| format!("invalid mapped host path: {}", host_path.display()))?;
+            Ok((
+                profile
+                    .prefix
+                    .join("dosdevices")
+                    .join(format!("{}:", drive.to_ascii_lowercase())),
+                canonical_host,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    sanitize_prefix_with_allowed_mappings(&profile.prefix, &allowed_mappings)
+}
+
+fn sanitize_prefix_with_allowed_mappings(
+    prefix: &Path,
+    allowed_mappings: &BTreeMap<PathBuf, PathBuf>,
+) -> Result<()> {
     let users = prefix.join("drive_c/users");
     let inspection = inspect_prefix(prefix)?;
-    for finding in inspection
-        .symlinks
-        .iter()
-        .filter(|item| item.escapes_prefix)
-    {
+    for finding in inspection.symlinks.iter().filter(|item| {
+        item.escapes_prefix
+            && allowed_mappings
+                .get(&item.path)
+                .is_none_or(|target| target != &item.resolved_target)
+    }) {
         fs::remove_file(&finding.path).with_context(|| {
             format!(
                 "failed to remove host integration {}",
@@ -1489,7 +1521,12 @@ fn sanitize_prefix(prefix: &Path) -> Result<()> {
     let remaining = inspect_prefix(prefix)?
         .symlinks
         .into_iter()
-        .filter(|item| item.escapes_prefix)
+        .filter(|item| {
+            item.escapes_prefix
+                && allowed_mappings
+                    .get(&item.path)
+                    .is_none_or(|target| target != &item.resolved_target)
+        })
         .map(|item| item.path)
         .collect::<Vec<_>>();
     if !remaining.is_empty() {
@@ -1961,6 +1998,42 @@ mod tests {
                 .iter()
                 .all(|finding| !finding.escapes_prefix)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_sanitization_preserves_only_the_exact_declared_mapping() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let allowed = temp.path().join("allowed");
+        let other = temp.path().join("other");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&other).unwrap();
+        let mapping = prefix.join("dosdevices/s:");
+        symlink(&allowed, &mapping).unwrap();
+        symlink("/", prefix.join("dosdevices/z:")).unwrap();
+        let mut value = profile(&prefix);
+        value.mappings.push(wineforge_core::HostMapping {
+            drive: "S".into(),
+            host_path: allowed,
+            access: MappingAccess::ReadWrite,
+        });
+
+        sanitize_profile(&value).unwrap();
+
+        assert_eq!(
+            fs::read_link(&mapping).unwrap(),
+            value.mappings[0].host_path
+        );
+        assert!(!prefix.join("dosdevices/z:").exists());
+
+        fs::remove_file(&mapping).unwrap();
+        symlink(other, &mapping).unwrap();
+        sanitize_profile(&value).unwrap();
+        assert!(!mapping.exists());
     }
 
     #[cfg(unix)]

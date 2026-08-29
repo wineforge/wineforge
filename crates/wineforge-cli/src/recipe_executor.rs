@@ -17,7 +17,7 @@ use crate::recipe::{
 };
 use crate::{
     add_wine_environment, add_winetricks_engine_environment, create_app_instance, engine_wine,
-    prepare_private_runtime, sandbox, sanitize_prefix, verify_host_exposure,
+    prepare_private_runtime, sandbox, sanitize_profile, verify_host_exposure,
     verify_managed_instance, write_json,
 };
 
@@ -349,7 +349,7 @@ fn execute_plan(
                 }
             }
         }
-        sanitize_prefix(&profile.prefix)?;
+        sanitize_profile(profile)?;
         verify_host_exposure(profile)?;
     }
     verify_postconditions(recipe, profile)?;

@@ -938,8 +938,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
     use wineforge_core::{
-        Artifact, ArtifactSource, EngineSelection, Environment, IsolationMode, IsolationPolicy,
-        Platform, Sha256Digest, Translation,
+        Artifact, ArtifactSource, EngineSelection, Environment, HostMapping, IsolationMode,
+        IsolationPolicy, MappingAccess, Platform, Sha256Digest, Translation,
     };
     use zip::write::SimpleFileOptions;
 
@@ -1133,6 +1133,8 @@ mod tests {
             }],
         };
         fs::write(&recipe_path, toml::to_string_pretty(&recipe).unwrap()).unwrap();
+        let shared_directory = temp.path().join("shared");
+        fs::create_dir(&shared_directory).unwrap();
         let profile = ApplicationProfile {
             schema_version: 1,
             id: "org.example.packaged-app".into(),
@@ -1147,7 +1149,11 @@ mod tests {
                 },
             )]),
             environment: Environment::default(),
-            mappings: Vec::new(),
+            mappings: vec![HostMapping {
+                drive: "S".into(),
+                host_path: shared_directory.clone(),
+                access: MappingAccess::ReadWrite,
+            }],
             isolation: IsolationPolicy {
                 mode: IsolationMode::Disabled,
             },
@@ -1183,6 +1189,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(bundled.prefix, app.join("Contents/WinePrefix"));
+            assert_eq!(
+                fs::read_link(app.join("Contents/WinePrefix/dosdevices/s:")).unwrap(),
+                shared_directory
+            );
         }
 
         #[cfg(target_os = "linux")]
