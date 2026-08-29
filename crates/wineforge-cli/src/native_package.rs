@@ -288,19 +288,23 @@ fn build_debian_package(request: &InstallRequest<'_>) -> Result<()> {
 
         let mut install_profile = request.profile.clone();
         install_profile.prefix = prefix_template.clone();
+        let mut provisioning_profile = install_profile.clone();
+        provisioning_profile.mappings.clear();
         recipe_executor::install(
             request.recipe,
             request.recipe_path,
-            &install_profile,
+            &provisioning_profile,
             request.engine,
             request.engine_root,
             request.winetricks_command,
             request.cache,
             request.accept_license,
         )?;
-        shutdown_wineserver(&install_profile, request.engine, request.engine_root)?;
-        let executable =
-            windows_path_to_prefix(&install_profile.prefix, &install_profile.executable)?;
+        shutdown_wineserver(&provisioning_profile, request.engine, request.engine_root)?;
+        let executable = windows_path_to_prefix(
+            &provisioning_profile.prefix,
+            &provisioning_profile.executable,
+        )?;
         write_icon_assets(&executable, &resources.join("AppIcon.png"), None)?;
         write_toml(&resources.join("profile.toml"), &install_profile)?;
         write_toml(&resources.join("engine.toml"), request.engine)?;
