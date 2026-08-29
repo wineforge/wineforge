@@ -86,9 +86,11 @@ class but a non-interactive run supplies no mapping; it never guesses a host
 directory.
 
 Engine builds can be long. Linux builds use Podman or Docker; macOS builds are
-native and may re-execute under Rosetta. Successful build archives and work
-trees are discarded by default. Add `--keep-build-artifacts` only when you need
-them for inspection.
+native and may re-execute under Rosetta. Generated engine archives and work
+trees are discarded by default. Verified Wine source downloads remain in the
+builder's content-addressed user cache and interrupted `.part` files resume on
+the next attempt. Add `--keep-build-artifacts` only when you need generated
+build output for inspection.
 
 ## 4. Install and launch directly
 

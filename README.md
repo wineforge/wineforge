@@ -72,8 +72,10 @@ the same operation:
 ```
 
 On Linux, use `--then-install deb --destination ./example_1.0.0_amd64.deb`.
-Successful local engine builds discard their archive and work tree unless
-`--keep-build-artifacts` is supplied.
+Successful local engine builds discard their generated engine archive and work
+tree unless `--keep-build-artifacts` is supplied. The verified Wine source
+download remains in the engine builder's user cache so later attempts do not
+download it again.
 
 See the [getting-started guide](docs/getting-started.md) for the complete flow,
 including direct stateless launches and manually installed engines.
