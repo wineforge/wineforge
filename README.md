@@ -52,7 +52,8 @@ wineforge recipe inspect recipe.toml
 wineforge prepare recipe.toml \
   --profile-out profile.toml \
   --engine-builder /absolute/path/to/wineforge-engines \
-  --build-if-missing
+  --build-if-missing \
+  --setup-engine-dependencies
 ```
 
 `prepare` is interactive by default. It shows the recipe's requested folder
@@ -76,6 +77,12 @@ Successful local engine builds discard their generated engine archive and work
 tree unless `--keep-build-artifacts` is supplied. The verified Wine source
 download remains in the engine builder's user cache so later attempts do not
 download it again.
+
+On macOS, `--setup-engine-dependencies` authorizes the trusted engine builder
+to install Intel Homebrew in `/usr/local` when absent and install its missing
+x86_64 formulae. It does not modify Apple Silicon Homebrew in `/opt/homebrew`.
+The official Homebrew installer may request administrator access. Omit the
+option when host package installation must remain diagnostic-only.
 
 See the [getting-started guide](docs/getting-started.md) for the complete flow,
 including direct stateless launches and manually installed engines.

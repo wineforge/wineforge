@@ -50,6 +50,7 @@ pub struct PrepareRequest<'a> {
     pub engine_builder: Option<&'a Path>,
     pub engine_version: Option<String>,
     pub build_if_missing: bool,
+    pub setup_engine_dependencies: bool,
     pub build_runtime: BuildRuntime,
     pub keep_build_artifacts: bool,
     pub non_interactive: bool,
@@ -156,6 +157,7 @@ pub fn execute(request: PrepareRequest<'_>) -> Result<PreparedApplication> {
                 request.engine_store,
                 &plan,
                 request.build_runtime,
+                request.setup_engine_dependencies,
                 request.keep_build_artifacts,
             )?
         }
@@ -538,6 +540,7 @@ fn build_and_install(
     store: &Path,
     plan: &BuildPlan,
     runtime: BuildRuntime,
+    setup_engine_dependencies: bool,
     keep_build_artifacts: bool,
 ) -> Result<EngineCandidate> {
     let build_store = store.join(".builds");
@@ -546,13 +549,18 @@ fn build_and_install(
     }
     require_real_directory(&build_store, "engine build store")?;
     println!("building engine {} with {}", plan.id, runtime.as_str());
-    let status = Command::new(plan.builder.join("scripts/build-local.sh"))
+    let mut command = Command::new(plan.builder.join("scripts/build-local.sh"));
+    command
         .arg(plan.version.to_string())
         .arg(&plan.target)
         .arg("--runtime")
         .arg(runtime.as_str())
         .arg("--store")
-        .arg(&build_store)
+        .arg(&build_store);
+    if setup_engine_dependencies {
+        command.arg("--setup-macos-deps");
+    }
+    let status = command
         .status()
         .context("failed to start the local engine builder")?;
     if !status.success() {
@@ -928,6 +936,7 @@ mod tests {
             engine_builder: None,
             engine_version: None,
             build_if_missing: false,
+            setup_engine_dependencies: false,
             build_runtime: BuildRuntime::Auto,
             keep_build_artifacts: false,
             non_interactive: true,

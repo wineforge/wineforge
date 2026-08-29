@@ -50,7 +50,8 @@ From a terminal, run:
 wineforge prepare wineforge-recipes/recipes/v1/RECIPE.toml \
   --profile-out ./profile.toml \
   --engine-builder ./wineforge-engines \
-  --build-if-missing
+  --build-if-missing \
+  --setup-engine-dependencies
 ```
 
 `prepare` performs these operations:
@@ -91,6 +92,14 @@ trees are discarded by default. Verified Wine source downloads remain in the
 builder's content-addressed user cache and interrupted `.part` files resume on
 the next attempt. Add `--keep-build-artifacts` only when you need generated
 build output for inspection.
+
+On macOS, `--setup-engine-dependencies` is explicit permission for the trusted
+engine checkout to bootstrap Intel Homebrew in `/usr/local` and install missing
+x86_64 build formulae. A separate Apple Silicon Homebrew installation in
+`/opt/homebrew` is left unchanged. The official installer may request
+administrator access while preparing `/usr/local`. Later builds reuse the same
+packages. Without this option, missing dependencies are reported but never
+installed.
 
 ## 4. Install and launch directly
 

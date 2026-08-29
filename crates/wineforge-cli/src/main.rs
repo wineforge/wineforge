@@ -64,6 +64,9 @@ enum Command {
         /// Permit a missing engine to start a potentially long local build without prompting.
         #[arg(long)]
         build_if_missing: bool,
+        /// Allow the trusted engine builder to install missing host build dependencies.
+        #[arg(long, requires = "engine_builder")]
+        setup_engine_dependencies: bool,
         #[arg(long, value_enum, default_value = "auto")]
         build_runtime: prepare::BuildRuntime,
         /// Retain the archive and work tree after the verified engine is installed.
@@ -343,6 +346,7 @@ fn main() -> Result<()> {
             engine_builder,
             engine_version,
             build_if_missing,
+            setup_engine_dependencies,
             build_runtime,
             keep_build_artifacts,
             non_interactive,
@@ -391,6 +395,7 @@ fn main() -> Result<()> {
                 engine_builder: engine_builder.as_deref(),
                 engine_version,
                 build_if_missing,
+                setup_engine_dependencies,
                 build_runtime,
                 keep_build_artifacts,
                 non_interactive,
@@ -1892,6 +1897,41 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn prepare_engine_dependency_setup_requires_a_builder() {
+        assert!(
+            Cli::try_parse_from([
+                "wineforge",
+                "prepare",
+                "recipe.toml",
+                "--profile-out",
+                "profile.toml",
+                "--setup-engine-dependencies",
+            ])
+            .is_err()
+        );
+
+        let cli = Cli::try_parse_from([
+            "wineforge",
+            "prepare",
+            "recipe.toml",
+            "--profile-out",
+            "profile.toml",
+            "--engine-builder",
+            "/trusted/wineforge-engines",
+            "--setup-engine-dependencies",
+        ])
+        .unwrap();
+        let Command::Prepare {
+            setup_engine_dependencies,
+            ..
+        } = cli.command
+        else {
+            panic!("prepare command was not parsed");
+        };
+        assert!(setup_engine_dependencies);
     }
 
     #[test]
