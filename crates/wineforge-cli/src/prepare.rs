@@ -9,9 +9,9 @@ use clap::ValueEnum;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use wineforge_core::{
-    ApplicationProfile, Artifact, ArtifactSource, EngineManifest, EngineSelection, Environment,
-    HostMapping, IsolationPolicy, License, MappingAccess, Platform, Sha256Digest, Translation,
-    Validate,
+    ApplicationProfile, Artifact, ArtifactSource, EngineDistribution, EngineManifest,
+    EngineSelection, Environment, HostMapping, IsolationPolicy, License, MappingAccess, Platform,
+    Sha256Digest, Translation, Validate,
 };
 
 use crate::recipe::{Recipe, Variant};
@@ -26,6 +26,24 @@ pub enum BuildRuntime {
     Docker,
     Podman,
     Native,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum EngineDistributionArg {
+    #[default]
+    Auto,
+    Shared,
+    Bundled,
+}
+
+impl From<EngineDistributionArg> for EngineDistribution {
+    fn from(value: EngineDistributionArg) -> Self {
+        match value {
+            EngineDistributionArg::Auto => Self::Auto,
+            EngineDistributionArg::Shared => Self::Shared,
+            EngineDistributionArg::Bundled => Self::Bundled,
+        }
+    }
 }
 
 impl BuildRuntime {
@@ -52,6 +70,7 @@ pub struct PrepareRequest<'a> {
     pub build_if_missing: bool,
     pub setup_engine_dependencies: bool,
     pub build_runtime: BuildRuntime,
+    pub engine_distribution: EngineDistributionArg,
     pub keep_build_artifacts: bool,
     pub non_interactive: bool,
 }
@@ -133,7 +152,7 @@ pub fn execute(request: PrepareRequest<'_>) -> Result<PreparedApplication> {
     )?;
 
     let interactive = !request.non_interactive && io::stdin().is_terminal();
-    let profile = configure_profile(&request, plan.id(), interactive)?;
+    let mut profile = configure_profile(&request, plan.id(), interactive)?;
 
     let candidate = match plan {
         EnginePlan::Installed(candidate) => {
@@ -162,6 +181,20 @@ pub fn execute(request: PrepareRequest<'_>) -> Result<PreparedApplication> {
             )?
         }
     };
+
+    let selection = profile
+        .engines
+        .get_mut(&candidate.manifest.platform)
+        .context("generated profile does not select the resolved engine platform")?;
+    selection.root = if selection.distribution == EngineDistribution::Bundled {
+        None
+    } else {
+        Some(crate::resolved_engine_root(
+            &candidate.manifest,
+            &candidate.root,
+        )?)
+    };
+    profile.validate().context("resolved profile is invalid")?;
 
     write_profile_atomic(request.profile_out, &profile)?;
     println!("wrote profile {}", request.profile_out.display());
@@ -255,6 +288,8 @@ fn configure_profile(
             crate::current_platform()?,
             EngineSelection {
                 id: engine_id.to_owned(),
+                distribution: request.engine_distribution.into(),
+                root: None,
             },
         )]),
         environment: Environment::default(),
@@ -938,6 +973,7 @@ mod tests {
             build_if_missing: false,
             setup_engine_dependencies: false,
             build_runtime: BuildRuntime::Auto,
+            engine_distribution: EngineDistributionArg::Auto,
             keep_build_artifacts: false,
             non_interactive: true,
         };

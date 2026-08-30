@@ -99,6 +99,7 @@ arguments = []
 
 [engines.macos-x86-64]
 id = "sample-engine-macos-x86_64"
+distribution = "auto"
 
 [environment]
 WINEDEBUG = "-all"
@@ -120,7 +121,7 @@ access = "read-write"
 | `prefix` | Absolute, non-root path without `..` |
 | `executable` | Non-empty Windows path |
 | `arguments` | Optional array passed directly to Wine |
-| `[engines.PLATFORM]` | Engine ID for `macos-x86-64` or `linux-x86-64`; at least one is required |
+| `[engines.PLATFORM]` | Engine ID and native-package distribution policy for `macos-x86-64` or `linux-x86-64`; at least one is required |
 | `[environment]` | Validated environment variables passed to Wine |
 | `[[mappings]]` | One host directory exposed as a DOS drive |
 | `[isolation]` | `required` by default; `disabled` is a diagnostic escape hatch |
@@ -133,6 +134,12 @@ isolation, and mappings with conflicting access may not overlap.
 Profiles deliberately have no installation actions or Winetricks list. Put
 reproducible dependencies in the recipe; use `wineforge app provision` only for
 a local diagnostic adjustment.
+
+An engine selection's `distribution` is `auto` by default. `auto` prefers the
+machine's shared engine, `shared` requires it, and `bundled` copies the engine
+into every native package. `prepare` records the verified absolute `root` for a
+shared engine. That generated field is machine-local and should not be put in a
+portable profile template.
 
 ## Engine manifest
 

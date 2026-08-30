@@ -183,6 +183,19 @@ impl Validate for ApplicationProfile {
                     "must be a lowercase identifier",
                 );
             }
+            if let Some(root) = &selection.root {
+                let field = format!("engines.{platform:?}.root");
+                if !root.is_absolute() {
+                    push(&mut errors, field, "must be absolute");
+                } else if is_filesystem_root(root) {
+                    push(&mut errors, field, "must not be a filesystem root");
+                } else if root
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+                {
+                    push(&mut errors, field, "must not contain `..` components");
+                }
+            }
         }
         validate_environment(&mut errors, "environment", &self.environment, true);
 

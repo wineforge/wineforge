@@ -7,9 +7,11 @@ arguments = []
 
 [engines.macos-x86-64]
 id = "sample-engine-macos-x86_64"
+distribution = "auto"
 
 [engines.linux-x86-64]
 id = "sample-engine-linux-x86_64"
+distribution = "auto"
 
 [environment]
 WINEDEBUG = "-all"

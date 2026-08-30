@@ -4,11 +4,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use wineforge_core::ApplicationProfile;
+use wineforge_core::{ApplicationProfile, EngineDistribution, EngineManifest};
 
 fn main() -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate native launcher")?;
     let layout = PackageLayout::discover(&executable)?;
+    let engine_root = resolve_engine_root(&layout)?;
     let profile = match layout.kind {
         PackageKind::MacosApp => prepare_macos_profile(&layout)?,
         PackageKind::LinuxPackage => prepare_linux_profile(&layout)?,
@@ -21,7 +22,7 @@ fn main() -> Result<()> {
         .arg("--engine-manifest")
         .arg(layout.engine_manifest)
         .arg("--engine-root")
-        .arg(layout.engine_root);
+        .arg(engine_root);
 
     #[cfg(unix)]
     {
@@ -62,7 +63,7 @@ struct PackageLayout {
     wineforge: PathBuf,
     profile_template: PathBuf,
     engine_manifest: PathBuf,
-    engine_root: PathBuf,
+    embedded_engine_root: PathBuf,
 }
 
 impl PackageLayout {
@@ -75,7 +76,7 @@ impl PackageLayout {
             .context("native launcher has no package root")?
             .to_path_buf();
         let macos_resources = root.join("Resources");
-        let (kind, resources, engine_root) = if macos_resources.is_dir() {
+        let (kind, resources, embedded_engine_root) = if macos_resources.is_dir() {
             (
                 PackageKind::MacosApp,
                 macos_resources,
@@ -94,7 +95,7 @@ impl PackageLayout {
             wineforge: binary_directory.join("wineforge"),
             profile_template: resources.join("profile.toml"),
             engine_manifest: resources.join("engine.toml"),
-            engine_root,
+            embedded_engine_root,
         };
         for (label, path) in [
             ("embedded Wineforge runtime", &layout.wineforge),
@@ -103,8 +104,58 @@ impl PackageLayout {
         ] {
             require_regular_file(path, label)?;
         }
-        require_real_directory(&layout.engine_root, "embedded engine")?;
         Ok(layout)
+    }
+}
+
+fn resolve_engine_root(layout: &PackageLayout) -> Result<PathBuf> {
+    let profile_text = fs::read_to_string(&layout.profile_template)
+        .context("failed to read profile for engine resolution")?;
+    let profile: ApplicationProfile =
+        toml::from_str(&profile_text).context("invalid profile TOML")?;
+    let manifest_text =
+        fs::read_to_string(&layout.engine_manifest).context("failed to read engine manifest")?;
+    let engine: EngineManifest =
+        toml::from_str(&manifest_text).context("invalid engine manifest TOML")?;
+    let selection = profile.engines.get(&engine.platform).with_context(|| {
+        format!(
+            "profile does not select an engine for {:?}",
+            engine.platform
+        )
+    })?;
+    if selection.id != engine.id {
+        anyhow::bail!(
+            "profile selects engine {} but package manifest describes {}",
+            selection.id,
+            engine.id
+        );
+    }
+
+    let shared = || -> Result<PathBuf> {
+        let root = selection
+            .root
+            .as_ref()
+            .context("shared engine selection has no resolved root")?;
+        require_real_directory(root, "shared engine")?;
+        fs::canonicalize(root).context("failed to resolve shared engine root")
+    };
+    match selection.distribution {
+        EngineDistribution::Shared => shared(),
+        EngineDistribution::Bundled => {
+            require_real_directory(&layout.embedded_engine_root, "embedded engine")?;
+            Ok(layout.embedded_engine_root.clone())
+        }
+        EngineDistribution::Auto => match shared() {
+            Ok(root) => Ok(root),
+            Err(shared_error) => {
+                if layout.embedded_engine_root.is_dir() {
+                    require_real_directory(&layout.embedded_engine_root, "embedded engine")?;
+                    Ok(layout.embedded_engine_root.clone())
+                } else {
+                    Err(shared_error).context("automatic engine resolution failed")
+                }
+            }
+        },
     }
 }
 
@@ -281,6 +332,7 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn rejects_links_that_escape_a_copied_prefix() {
@@ -295,5 +347,61 @@ mod tests {
             &root.join("dosdevices/z:"),
             Path::new("../../../../")
         ));
+    }
+
+    #[test]
+    fn resolves_shared_engine_and_auto_falls_back_to_embedded() {
+        let temp = tempdir().unwrap();
+        let resources = temp.path().join("Resources");
+        let shared = temp.path().join("shared-engine");
+        let embedded = temp.path().join("Frameworks/WineEngine");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir(&shared).unwrap();
+        fs::create_dir_all(&embedded).unwrap();
+        fs::write(
+            resources.join("engine.toml"),
+            r#"schema_version = 1
+id = "sample-engine-macos-x86_64"
+platform = "macos-x86-64"
+host_architecture = "x86_64"
+wine_binary = "bin/wine"
+[artifact]
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+[artifact.source]
+kind = "user-supplied"
+[license]
+name = "Test"
+url = "https://example.invalid/license"
+"#,
+        )
+        .unwrap();
+        let write_profile = |distribution: &str, root: Option<&Path>| {
+            let root = root
+                .map(|path| format!("root = {:?}\n", path))
+                .unwrap_or_default();
+            fs::write(
+                resources.join("profile.toml"),
+                format!(
+                    "schema_version = 1\nid = \"sample\"\nname = \"Sample\"\nprefix = \"/tmp/sample-prefix\"\nexecutable = \"C:\\\\sample.exe\"\n[engines.macos-x86-64]\nid = \"sample-engine-macos-x86_64\"\ndistribution = \"{distribution}\"\n{root}"
+                ),
+            )
+            .unwrap();
+        };
+        let layout = PackageLayout {
+            kind: PackageKind::MacosApp,
+            root: temp.path().to_path_buf(),
+            wineforge: temp.path().join("wineforge"),
+            profile_template: resources.join("profile.toml"),
+            engine_manifest: resources.join("engine.toml"),
+            embedded_engine_root: embedded.clone(),
+        };
+
+        write_profile("shared", Some(&shared));
+        assert_eq!(
+            resolve_engine_root(&layout).unwrap(),
+            fs::canonicalize(&shared).unwrap()
+        );
+        write_profile("auto", None);
+        assert_eq!(resolve_engine_root(&layout).unwrap(), embedded);
     }
 }

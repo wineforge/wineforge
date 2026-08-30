@@ -10,8 +10,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use icns::{IconFamily, Image as IcnsImage, PixelFormat};
 use pelite::PeFile;
-use serde::Serialize;
-use wineforge_core::{ApplicationProfile, EngineManifest};
+use serde::{Deserialize, Serialize};
+use wineforge_core::{ApplicationProfile, EngineDistribution, EngineManifest, Validate};
 
 use crate::recipe::{Recipe, windows_path_to_prefix};
 use crate::{adopt_imported_instance, recipe_executor, resolved_engine_root, shutdown_wineserver};
@@ -20,6 +20,29 @@ use crate::{adopt_imported_instance, recipe_executor, resolved_engine_root, shut
 pub enum NativeFormat {
     App,
     Deb,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PackageEngine {
+    Shared(PathBuf),
+    Bundled(PathBuf),
+}
+
+impl PackageEngine {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Shared(root) | Self::Bundled(root) => root,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineMarker {
+    schema_version: u32,
+    kind: String,
+    id: String,
+    artifact_sha256: Option<String>,
 }
 
 pub struct InstallRequest<'a> {
@@ -45,6 +68,14 @@ pub struct ImportRequest<'a> {
     pub engine: &'a EngineManifest,
     pub engine_root: &'a Path,
     pub destination: &'a Path,
+    pub wineforge_binary: &'a Path,
+    pub launcher_binary: &'a Path,
+}
+
+pub struct RelinkRequest<'a> {
+    pub application: &'a Path,
+    pub engine_root: &'a Path,
+    pub distribution: EngineDistribution,
     pub wineforge_binary: &'a Path,
     pub launcher_binary: &'a Path,
 }
@@ -124,20 +155,22 @@ pub fn import_macos_app(request: &ImportRequest<'_>) -> Result<()> {
         let resources = contents.join("Resources");
         let engine_destination = contents.join("Frameworks/WineEngine");
         let prefix_destination = contents.join("WinePrefix");
+        let package_engine =
+            resolve_package_engine(request.profile, request.engine, request.engine_root)?;
         fs::create_dir_all(&macos)?;
         fs::create_dir_all(&resources)?;
-        fs::create_dir_all(contents.join("Frameworks"))?;
         copy_executable(request.wineforge_binary, &macos.join("wineforge"))?;
         copy_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
-        copy_tree(
-            &resolved_engine_root(request.engine, request.engine_root)?,
-            &engine_destination,
-        )?;
+        if matches!(&package_engine, PackageEngine::Bundled(_)) {
+            fs::create_dir_all(contents.join("Frameworks"))?;
+            copy_tree(package_engine.root(), &engine_destination)?;
+        }
         copy_imported_prefix(request.source_prefix, &prefix_destination)?;
 
-        let mut imported_profile = request.profile.clone();
+        let mut imported_profile =
+            deployed_profile(request.profile, request.engine, &package_engine)?;
         imported_profile.prefix = prefix_destination.clone();
-        adopt_imported_instance(&imported_profile, request.engine, &engine_destination)?;
+        adopt_imported_instance(&imported_profile, request.engine, package_engine.root())?;
 
         let executable =
             windows_path_to_prefix(&imported_profile.prefix, &imported_profile.executable)?;
@@ -146,7 +179,7 @@ pub fn import_macos_app(request: &ImportRequest<'_>) -> Result<()> {
             &resources.join("AppIcon.png"),
             Some(&resources.join("AppIcon.icns")),
         )?;
-        let mut final_profile = request.profile.clone();
+        let mut final_profile = deployed_profile(request.profile, request.engine, &package_engine)?;
         final_profile.prefix = request.destination.join("Contents/WinePrefix");
         write_toml(&resources.join("profile.toml"), &final_profile)?;
         write_toml(&resources.join("engine.toml"), request.engine)?;
@@ -174,6 +207,90 @@ pub fn import_macos_app(request: &ImportRequest<'_>) -> Result<()> {
     Ok(())
 }
 
+pub fn relink_macos_app(request: &RelinkRequest<'_>) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("macOS application bundles can only be relinked on macOS");
+    }
+    require_real_directory(request.application, "macOS application")?;
+    if request.application.extension() != Some(OsStr::new("app")) {
+        bail!("macOS application must end in .app");
+    }
+    require_regular_file(request.wineforge_binary, "Wineforge executable")?;
+    require_regular_file(request.launcher_binary, "Wineforge native launcher")?;
+
+    let contents = request.application.join("Contents");
+    let resources = contents.join("Resources");
+    let profile_path = resources.join("profile.toml");
+    let engine_path = resources.join("engine.toml");
+    require_regular_file(&profile_path, "profile snapshot")?;
+    require_regular_file(&engine_path, "engine manifest snapshot")?;
+    let mut profile: ApplicationProfile = toml::from_str(&fs::read_to_string(&profile_path)?)
+        .context("invalid packaged profile TOML")?;
+    let engine: EngineManifest = toml::from_str(&fs::read_to_string(&engine_path)?)
+        .context("invalid packaged engine manifest TOML")?;
+    profile.validate().context("packaged profile is invalid")?;
+    engine
+        .validate()
+        .context("packaged engine manifest is invalid")?;
+    let resolved_root = resolved_engine_root(&engine, request.engine_root)?;
+    let selection = profile.engines.get_mut(&engine.platform).with_context(|| {
+        format!(
+            "profile does not select an engine for {:?}",
+            engine.platform
+        )
+    })?;
+    if selection.id != engine.id {
+        bail!(
+            "profile selects engine {} but package manifest describes {}",
+            selection.id,
+            engine.id
+        );
+    }
+
+    let embedded = contents.join("Frameworks/WineEngine");
+    let use_shared = match request.distribution {
+        EngineDistribution::Shared => true,
+        EngineDistribution::Bundled => false,
+        EngineDistribution::Auto => is_managed_engine_root(&resolved_root, &engine)?,
+    };
+    if use_shared {
+        selection.root = Some(resolved_root);
+    } else {
+        if fs::symlink_metadata(&embedded).is_err() {
+            fs::create_dir_all(embedded.parent().context("engine has no parent")?)?;
+            let staging = contents.join(format!(
+                "Frameworks/.WineEngine.{}.staging",
+                std::process::id()
+            ));
+            copy_tree(&resolved_root, &staging)?;
+            fs::rename(&staging, &embedded)?;
+        }
+        selection.root = None;
+    }
+    selection.distribution = request.distribution;
+    profile.validate().context("relinked profile is invalid")?;
+
+    let macos = contents.join("MacOS");
+    replace_executable(request.wineforge_binary, &macos.join("wineforge"))?;
+    replace_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
+    write_toml_atomic(&profile_path, &profile)?;
+    if use_shared && fs::symlink_metadata(&embedded).is_ok() {
+        require_real_directory(&embedded, "embedded engine")?;
+        fs::remove_dir_all(&embedded).context("failed to remove superseded embedded engine")?;
+        let frameworks = contents.join("Frameworks");
+        if frameworks.read_dir()?.next().is_none() {
+            fs::remove_dir(frameworks)?;
+        }
+    }
+    println!(
+        "configured {} to use {:?} engine {}",
+        request.application.display(),
+        request.distribution,
+        engine.id
+    );
+    Ok(())
+}
+
 fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!("macOS application bundles must be built on macOS");
@@ -196,17 +313,19 @@ fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
         let macos = contents.join("MacOS");
         let resources = contents.join("Resources");
         let engine_destination = contents.join("Frameworks/WineEngine");
+        let package_engine =
+            resolve_package_engine(request.profile, request.engine, request.engine_root)?;
         fs::create_dir_all(&macos)?;
         fs::create_dir_all(&resources)?;
-        fs::create_dir_all(contents.join("Frameworks"))?;
         copy_executable(request.wineforge_binary, &macos.join("wineforge"))?;
         copy_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
-        copy_tree(
-            &resolved_engine_root(request.engine, request.engine_root)?,
-            &engine_destination,
-        )?;
+        if matches!(&package_engine, PackageEngine::Bundled(_)) {
+            fs::create_dir_all(contents.join("Frameworks"))?;
+            copy_tree(package_engine.root(), &engine_destination)?;
+        }
 
-        let mut install_profile = request.profile.clone();
+        let mut install_profile =
+            deployed_profile(request.profile, request.engine, &package_engine)?;
         install_profile.prefix = staging.join("Contents/WinePrefix");
         recipe_executor::install(
             request.recipe,
@@ -227,7 +346,7 @@ fn install_macos_app(request: &InstallRequest<'_>) -> Result<()> {
             &resources.join("AppIcon.png"),
             Some(&resources.join("AppIcon.icns")),
         )?;
-        let mut final_profile = request.profile.clone();
+        let mut final_profile = deployed_profile(request.profile, request.engine, &package_engine)?;
         final_profile.prefix = request.destination.join("Contents/WinePrefix");
         write_toml(&resources.join("profile.toml"), &final_profile)?;
         write_toml(&resources.join("engine.toml"), request.engine)?;
@@ -281,12 +400,14 @@ fn build_debian_package(request: &InstallRequest<'_>) -> Result<()> {
         fs::create_dir_all(&resources)?;
         copy_executable(request.wineforge_binary, &bin.join("wineforge"))?;
         copy_executable(request.launcher_binary, &bin.join("wineforge-launcher"))?;
-        copy_tree(
-            &resolved_engine_root(request.engine, request.engine_root)?,
-            &engine_destination,
-        )?;
+        let package_engine =
+            resolve_package_engine(request.profile, request.engine, request.engine_root)?;
+        if matches!(&package_engine, PackageEngine::Bundled(_)) {
+            copy_tree(package_engine.root(), &engine_destination)?;
+        }
 
-        let mut install_profile = request.profile.clone();
+        let mut install_profile =
+            deployed_profile(request.profile, request.engine, &package_engine)?;
         install_profile.prefix = prefix_template.clone();
         let mut provisioning_profile = install_profile.clone();
         provisioning_profile.mappings.clear();
@@ -335,6 +456,93 @@ fn build_debian_package(request: &InstallRequest<'_>) -> Result<()> {
     result?;
     println!("built Debian package {}", request.destination.display());
     Ok(())
+}
+
+fn resolve_package_engine(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    engine_root: &Path,
+) -> Result<PackageEngine> {
+    let selection = profile.engines.get(&engine.platform).with_context(|| {
+        format!(
+            "profile does not select an engine for {:?}",
+            engine.platform
+        )
+    })?;
+    if selection.id != engine.id {
+        bail!(
+            "profile selects engine {} but manifest describes {}",
+            selection.id,
+            engine.id
+        );
+    }
+    let root = resolved_engine_root(engine, engine_root)?;
+    match selection.distribution {
+        EngineDistribution::Bundled => Ok(PackageEngine::Bundled(root)),
+        EngineDistribution::Shared => Ok(PackageEngine::Shared(root)),
+        EngineDistribution::Auto if is_managed_engine_root(&root, engine)? => {
+            Ok(PackageEngine::Shared(root))
+        }
+        EngineDistribution::Auto => Ok(PackageEngine::Bundled(root)),
+    }
+}
+
+fn is_managed_engine_root(root: &Path, engine: &EngineManifest) -> Result<bool> {
+    let marker_paths = [
+        root.join(".wineforge-engine.json"),
+        root.parent()
+            .map(|parent| parent.join(".wineforge-engine.json"))
+            .unwrap_or_default(),
+    ];
+    for marker_path in marker_paths {
+        if marker_path.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&marker_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("unsafe engine marker: {}", marker_path.display());
+        }
+        let marker: EngineMarker = serde_json::from_slice(&fs::read(&marker_path)?)
+            .with_context(|| format!("invalid engine marker {}", marker_path.display()))?;
+        if marker.schema_version != 1 || marker.kind != "engine" || marker.id != engine.id {
+            bail!(
+                "engine marker does not match manifest: {}",
+                marker_path.display()
+            );
+        }
+        if let Some(digest) = marker.artifact_sha256 {
+            if digest != engine.artifact.sha256.0 {
+                bail!(
+                    "engine marker digest does not match manifest: {}",
+                    marker_path.display()
+                );
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn deployed_profile(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+    package_engine: &PackageEngine,
+) -> Result<ApplicationProfile> {
+    let mut deployed = profile.clone();
+    let selection = deployed
+        .engines
+        .get_mut(&engine.platform)
+        .context("profile engine selection disappeared")?;
+    match package_engine {
+        PackageEngine::Shared(root) => selection.root = Some(root.clone()),
+        PackageEngine::Bundled(_) => selection.root = None,
+    }
+    deployed.validate().context("deployed profile is invalid")?;
+    Ok(deployed)
 }
 
 fn staging_path(destination: &Path) -> Result<PathBuf> {
@@ -615,11 +823,49 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn write_toml_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let filename = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("TOML path filename is not UTF-8")?;
+    let temporary =
+        path.with_file_name(format!(".{filename}.wineforge-{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        write_toml(&temporary, value)?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to commit {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 fn copy_executable(source: &Path, destination: &Path) -> Result<()> {
     copy_regular_file(source, destination)?;
     let permissions = fs::metadata(source)?.permissions();
     fs::set_permissions(destination, permissions)?;
     Ok(())
+}
+
+fn replace_executable(source: &Path, destination: &Path) -> Result<()> {
+    let filename = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("executable filename is not UTF-8")?;
+    let temporary =
+        destination.with_file_name(format!(".{filename}.wineforge-{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        copy_executable(source, &temporary)?;
+        fs::rename(&temporary, destination)
+            .with_context(|| format!("failed to replace {}", destination.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
@@ -1067,12 +1313,22 @@ mod tests {
         } else {
             "linux"
         };
+        let translation = if cfg!(target_os = "macos") {
+            Translation::Rosetta2
+        } else {
+            Translation::Native
+        };
+        let translation_name = if cfg!(target_os = "macos") {
+            "rosetta2"
+        } else {
+            "native"
+        };
         let engine = EngineManifest {
             schema_version: 1,
             id: "test-engine".into(),
             platform,
-            host_architecture: std::env::consts::ARCH.into(),
-            translation: Translation::Native,
+            host_architecture: "x86_64".into(),
+            translation,
             artifact: Artifact {
                 source: ArtifactSource::UserSupplied,
                 sha256: Sha256Digest("0".repeat(64)),
@@ -1085,6 +1341,17 @@ mod tests {
                 acceptance_required: false,
             },
         };
+        fs::write(
+            engine_root.join(".wineforge-engine.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "kind": "engine",
+                "id": engine.id.clone(),
+                "artifact_sha256": engine.artifact.sha256.0.clone(),
+            })
+            .to_string(),
+        )
+        .unwrap();
         let recipe = Recipe {
             schema_version: 1,
             id: "org.example.packaged-app".into(),
@@ -1105,7 +1372,7 @@ mod tests {
             variants: vec![Variant {
                 platform: platform_name.into(),
                 host_architecture: std::env::consts::ARCH.into(),
-                translation: "native".into(),
+                translation: translation_name.into(),
                 engine: VariantEngine {
                     family: "test".into(),
                     version: "1".into(),
@@ -1150,6 +1417,8 @@ mod tests {
                 platform,
                 EngineSelection {
                     id: engine.id.clone(),
+                    distribution: Default::default(),
+                    root: None,
                 },
             )]),
             environment: Environment::default(),
@@ -1184,19 +1453,55 @@ mod tests {
             .unwrap();
             assert!(app.join("Contents/Info.plist").is_file());
             assert!(app.join("Contents/Resources/AppIcon.icns").is_file());
-            assert!(
-                app.join("Contents/Frameworks/WineEngine/bin/wine")
-                    .is_file()
-            );
-            let bundled: ApplicationProfile = toml::from_str(
+            assert!(!app.join("Contents/Frameworks/WineEngine").exists());
+            let deployed: ApplicationProfile = toml::from_str(
                 &fs::read_to_string(app.join("Contents/Resources/profile.toml")).unwrap(),
             )
             .unwrap();
-            assert_eq!(bundled.prefix, app.join("Contents/WinePrefix"));
+            assert_eq!(deployed.prefix, app.join("Contents/WinePrefix"));
+            let selection = deployed.engines.get(&platform).unwrap();
+            assert_eq!(selection.distribution, EngineDistribution::Auto);
+            assert_eq!(
+                selection.root.as_ref().unwrap(),
+                &fs::canonicalize(&engine_root).unwrap()
+            );
             assert_eq!(
                 fs::read_link(app.join("Contents/WinePrefix/dosdevices/s:")).unwrap(),
                 shared_directory
             );
+
+            let mut bundled_profile = profile.clone();
+            bundled_profile
+                .engines
+                .get_mut(&platform)
+                .unwrap()
+                .distribution = EngineDistribution::Bundled;
+            assert!(matches!(
+                resolve_package_engine(&bundled_profile, &engine, &engine_root).unwrap(),
+                PackageEngine::Bundled(_)
+            ));
+
+            relink_macos_app(&RelinkRequest {
+                application: &app,
+                engine_root: &engine_root,
+                distribution: EngineDistribution::Bundled,
+                wineforge_binary: &runtime,
+                launcher_binary: &launcher,
+            })
+            .unwrap();
+            assert!(
+                app.join("Contents/Frameworks/WineEngine/bin/wine")
+                    .is_file()
+            );
+            relink_macos_app(&RelinkRequest {
+                application: &app,
+                engine_root: &engine_root,
+                distribution: EngineDistribution::Auto,
+                wineforge_binary: &runtime,
+                launcher_binary: &launcher,
+            })
+            .unwrap();
+            assert!(!app.join("Contents/Frameworks/WineEngine").exists());
         }
 
         #[cfg(target_os = "linux")]
