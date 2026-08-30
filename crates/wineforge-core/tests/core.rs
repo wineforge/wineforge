@@ -22,6 +22,8 @@ fn profile(prefix: &Path) -> ApplicationProfile {
             Platform::MacosX86_64,
             EngineSelection {
                 id: "verified-wine-10".into(),
+                distribution: Default::default(),
+                root: None,
             },
         )]),
         environment: Environment(BTreeMap::from([("WINEDEBUG".into(), "-all".into())])),

@@ -47,6 +47,24 @@ pub enum IsolationMode {
 #[serde(deny_unknown_fields)]
 pub struct EngineSelection {
     pub id: String,
+    /// How native packages should make this engine available at runtime.
+    #[serde(default)]
+    pub distribution: EngineDistribution,
+    /// Resolved machine-local engine root used by shared native packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineDistribution {
+    /// Prefer a shared engine and fall back to a bundled engine when necessary.
+    #[default]
+    Auto,
+    /// Reference one engine from the machine-local engine store.
+    Shared,
+    /// Copy the engine into the native package.
+    Bundled,
 }
 
 /// Environment variables passed to Wine. Keys and values are validated before use.

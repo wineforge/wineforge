@@ -11,9 +11,9 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wineforge_core::{
-    ApplicationProfile, CurrentMapping, EngineManifest, IsolationMode, MappingAccess,
-    MappingAction, Platform, Translation, Validate, apply_mapping_plan, inspect_prefix,
-    plan_mappings,
+    ApplicationProfile, CurrentMapping, EngineDistribution, EngineManifest, IsolationMode,
+    MappingAccess, MappingAction, Platform, Translation, Validate, apply_mapping_plan,
+    inspect_prefix, plan_mappings,
 };
 
 mod chocolatey;
@@ -69,6 +69,9 @@ enum Command {
         setup_engine_dependencies: bool,
         #[arg(long, value_enum, default_value = "auto")]
         build_runtime: prepare::BuildRuntime,
+        /// How installed native packages should obtain their engine.
+        #[arg(long, value_enum, default_value = "auto")]
+        engine_distribution: prepare::EngineDistributionArg,
         /// Retain the archive and work tree after the verified engine is installed.
         #[arg(long)]
         keep_build_artifacts: bool,
@@ -217,6 +220,23 @@ enum AppCommand {
         #[arg(long)]
         launcher_binary: Option<PathBuf>,
     },
+    /// Change an installed macOS app between shared and bundled engine storage.
+    RelinkEngine {
+        /// Existing Wineforge-managed .app bundle.
+        application: PathBuf,
+        /// Installed engine directory or its wineforge-engine child.
+        #[arg(long)]
+        engine_root: PathBuf,
+        /// Engine storage policy written back to the packaged profile.
+        #[arg(long, value_enum, default_value = "auto")]
+        distribution: prepare::EngineDistributionArg,
+        /// Wineforge executable installed into the application. Defaults to this executable.
+        #[arg(long)]
+        wineforge_binary: Option<PathBuf>,
+        /// Generic native launcher installed into the application. Defaults to a sibling binary.
+        #[arg(long)]
+        launcher_binary: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,6 +368,7 @@ fn main() -> Result<()> {
             build_if_missing,
             setup_engine_dependencies,
             build_runtime,
+            engine_distribution,
             keep_build_artifacts,
             non_interactive,
             then_install,
@@ -397,6 +418,7 @@ fn main() -> Result<()> {
                 build_if_missing,
                 setup_engine_dependencies,
                 build_runtime,
+                engine_distribution,
                 keep_build_artifacts,
                 non_interactive,
             })?;
@@ -467,6 +489,27 @@ fn main() -> Result<()> {
                     engine: &engine,
                     engine_root: &engine_root,
                     destination: &destination,
+                    wineforge_binary: &wineforge_binary,
+                    launcher_binary: &launcher_binary,
+                })?;
+            }
+            AppCommand::RelinkEngine {
+                application,
+                engine_root,
+                distribution,
+                wineforge_binary,
+                launcher_binary,
+            } => {
+                let current_executable =
+                    std::env::current_exe().context("failed to locate the Wineforge executable")?;
+                let wineforge_binary =
+                    wineforge_binary.unwrap_or_else(|| current_executable.clone());
+                let launcher_binary = launcher_binary
+                    .unwrap_or_else(|| current_executable.with_file_name("wineforge-launcher"));
+                native_package::relink_macos_app(&native_package::RelinkRequest {
+                    application: &application,
+                    engine_root: &engine_root,
+                    distribution: EngineDistribution::from(distribution),
                     wineforge_binary: &wineforge_binary,
                     launcher_binary: &launcher_binary,
                 })?;
@@ -834,7 +877,7 @@ fn prune_engines(
     profiles: &[PathBuf],
     confirmed: bool,
 ) -> Result<()> {
-    let mut protected = BTreeSet::new();
+    let mut protected = discover_installed_engine_references(store)?;
     for path in profiles {
         let profile = read_profile(path)?;
         protected.extend(
@@ -854,6 +897,55 @@ fn prune_engines(
         &protected,
         confirmed,
     )
+}
+
+fn discover_installed_engine_references(store: &Path) -> Result<BTreeSet<String>> {
+    let mut protected = BTreeSet::new();
+    let Some(application_root) = store.parent() else {
+        return Ok(protected);
+    };
+    let metadata = match fs::symlink_metadata(application_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(protected),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "engine store parent must be a real directory: {}",
+            application_root.display()
+        );
+    }
+    for entry in fs::read_dir(application_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("app") {
+            continue;
+        }
+        let profile_path = path.join("Contents/Resources/profile.toml");
+        let profile_metadata = match fs::symlink_metadata(&profile_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !profile_metadata.is_file() || profile_metadata.file_type().is_symlink() {
+            bail!(
+                "installed profile must be a regular file: {}",
+                profile_path.display()
+            );
+        }
+        let profile = read_profile(&profile_path)?;
+        protected.extend(
+            profile
+                .engines
+                .values()
+                .filter(|selection| {
+                    selection.distribution != EngineDistribution::Bundled
+                        && selection.root.is_some()
+                })
+                .map(|selection| selection.id.clone()),
+        );
+    }
+    Ok(protected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,7 +992,7 @@ fn prune_managed_entries(
         }
         if protected.contains(&marker.id) {
             bail!(
-                "refusing to prune {label} {} because a supplied profile references it",
+                "refusing to prune {label} {} because a profile or installed package references it",
                 marker.id
             );
         }
@@ -1765,6 +1857,8 @@ mod tests {
                 Platform::MacosX86_64,
                 wineforge_core::EngineSelection {
                     id: "example-engine-macos-x86_64".into(),
+                    distribution: Default::default(),
+                    root: None,
                 },
             )]),
             environment: Environment::default(),
@@ -2234,6 +2328,39 @@ mod tests {
             &protected,
             true,
         );
+        assert!(result.is_err());
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn prune_discovers_shared_engine_references_in_installed_apps() {
+        let temp = tempdir().unwrap();
+        let store = temp.path().join("engines");
+        let directory = store.join("example-engine-macos-x86_64");
+        fs::create_dir_all(&directory).unwrap();
+        write_json(
+            &directory.join(ENGINE_MARKER),
+            &ManagedEntry {
+                schema_version: 1,
+                kind: "engine".into(),
+                id: "example-engine-macos-x86_64".into(),
+                artifact_sha256: Some("0".repeat(64)),
+            },
+        )
+        .unwrap();
+        let resources = temp.path().join("Example.app/Contents/Resources");
+        fs::create_dir_all(&resources).unwrap();
+        let mut installed = profile(&temp.path().join("prefix"));
+        let selection = installed.engines.get_mut(&Platform::MacosX86_64).unwrap();
+        selection.distribution = EngineDistribution::Shared;
+        selection.root = Some(directory.join("wineforge-engine"));
+        fs::write(
+            resources.join("profile.toml"),
+            toml::to_string_pretty(&installed).unwrap(),
+        )
+        .unwrap();
+
+        let result = prune_engines(&store, &[], true, &[], true);
         assert!(result.is_err());
         assert!(directory.exists());
     }

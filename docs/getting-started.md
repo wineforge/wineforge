@@ -148,6 +148,16 @@ wineforge prepare recipe.toml \
   --destination "$HOME/Applications/Wineforge/Example.app"
 ```
 
+`--engine-distribution auto` is the default and installs a small launcher that
+references the verified engine in the local engine store. Pass
+`--engine-distribution bundled` when the package must remain portable without
+that store. Existing Wineforge macOS applications can be converted safely:
+
+```sh
+wineforge app relink-engine "$HOME/Applications/Wineforge/Example.app" \
+  --engine-root "$HOME/Applications/Wineforge/engines/ENGINE_ID"
+```
+
 Linux:
 
 ```sh
@@ -191,4 +201,6 @@ wineforge recipe prune-cache --sha256 SHA256 --yes
 ```
 
 Pruning recognizes only immediate child directories with Wineforge management
-markers. Unmarked data is ignored.
+markers. Unmarked data is ignored. Engine pruning also scans sibling installed
+macOS applications and refuses to remove an engine referenced by a shared or
+automatic selection.

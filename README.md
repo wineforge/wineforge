@@ -160,9 +160,9 @@ reference.
 ## Native packages
 
 `wineforge run` remains stateless: it receives a profile, engine manifest, and
-engine root on every launch. Generated native packages embed those inputs and
-call the same command through a generic launcher; Wineforge does not maintain a
-global application registry.
+engine root on every launch. Generated native packages snapshot those inputs
+and call the same command through a generic launcher; Wineforge does not
+maintain a global application registry.
 
 - A macOS `.app` contains its writable prefix and extracts an icon from the
   installed PE executable without executing it.
@@ -170,9 +170,11 @@ global application registry.
   Its first launch creates per-user state under `$XDG_DATA_HOME/wineforge` or
   `$HOME/.local/share/wineforge`.
 
-Packages currently embed their engines so pruning a shared engine cannot break
-an installed application. Generated packages are unsigned; signing,
-notarization, RPM output, and document-type registration are future work.
+Native packages use a shared, verified engine by default. Profiles may request
+`distribution = "bundled"` for a self-contained portable package. Engine
+pruning discovers installed shared references and refuses unsafe deletion.
+Generated packages are unsigned; signing, notarization, RPM output, and
+document-type registration are future work.
 
 ## Project repositories
 
