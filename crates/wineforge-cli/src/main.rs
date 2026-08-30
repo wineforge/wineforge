@@ -1168,11 +1168,18 @@ pub(crate) fn shutdown_wineserver(
         let status = command
             .status()
             .with_context(|| format!("failed to run wineserver {argument}"))?;
-        if !status.success() {
+        // Wine and CrossOver return 1 when `-k` finds no running server. That
+        // is already the desired postcondition, so continue to the `-w`
+        // barrier instead of failing a completed installation.
+        if !wineserver_shutdown_status_ok(argument, &status) {
             bail!("wineserver {argument} exited with {status}");
         }
     }
     Ok(())
+}
+
+fn wineserver_shutdown_status_ok(argument: &str, status: &std::process::ExitStatus) -> bool {
+    status.success() || (argument == "-k" && status.code() == Some(1))
 }
 
 pub(crate) fn resolved_engine_root(engine: &EngineManifest, engine_root: &Path) -> Result<PathBuf> {
@@ -1817,6 +1824,27 @@ mod tests {
                 .next()
                 .is_some_and(|path| path == bin)
         );
+    }
+
+    #[test]
+    fn wineserver_shutdown_accepts_only_the_no_server_kill_status() {
+        let success = ProcessCommand::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+        let no_server = ProcessCommand::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .unwrap();
+        let other_failure = ProcessCommand::new("sh")
+            .args(["-c", "exit 2"])
+            .status()
+            .unwrap();
+
+        assert!(wineserver_shutdown_status_ok("-k", &success));
+        assert!(wineserver_shutdown_status_ok("-k", &no_server));
+        assert!(!wineserver_shutdown_status_ok("-w", &no_server));
+        assert!(!wineserver_shutdown_status_ok("-k", &other_failure));
     }
 
     #[test]

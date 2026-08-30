@@ -46,6 +46,13 @@ enum PlannedStep {
         source_sha256: String,
         destination: String,
     },
+    SetRegistryValue {
+        hive: String,
+        key: String,
+        name: String,
+        value_type: String,
+        value: toml::Value,
+    },
     Winetricks {
         verbs: Vec<String>,
     },
@@ -222,15 +229,27 @@ pub fn install(
                     destination: destination.clone(),
                 });
             }
+            InstallStep::SetRegistryValue {
+                hive,
+                key,
+                name,
+                value_type,
+                value,
+            } => {
+                registry_arguments(hive, key, name, value_type, value)?;
+                plan.push(PlannedStep::SetRegistryValue {
+                    hive: hive.clone(),
+                    key: key.clone(),
+                    name: name.clone(),
+                    value_type: value_type.clone(),
+                    value: value.clone(),
+                });
+            }
             InstallStep::Winetricks { verbs } => {
                 plan.push(PlannedStep::Winetricks {
                     verbs: verbs.clone(),
                 });
             }
-            other => bail!(
-                "native execution of {} is not implemented yet",
-                other.action_name()
-            ),
         }
     }
 
@@ -337,6 +356,25 @@ fn execute_plan(
                 source_sha256,
                 destination,
             } => copy_file(profile, source, source_sha256, destination)?,
+            PlannedStep::SetRegistryValue {
+                hive,
+                key,
+                name,
+                value_type,
+                value,
+            } => {
+                let arguments = registry_arguments(hive, key, name, value_type, value)?;
+                let mut command = sandbox::command(profile, engine_root, &wine)?;
+                command.args(arguments);
+                command.current_dir(profile.prefix.join("drive_c"));
+                add_wine_environment(&mut command, profile, engine);
+                let status = command
+                    .status()
+                    .context("failed to start Wine registry editor")?;
+                if !status.success() {
+                    bail!("set-registry-value installation step exited with {status}");
+                }
+            }
             PlannedStep::Winetricks { verbs } => {
                 let mut command = sandbox::command(profile, engine_root, winetricks_command)?;
                 command.arg("-q").args(verbs);
@@ -370,6 +408,56 @@ fn execute_plan(
     )?;
     println!("installed recipe {} {}", recipe.id, recipe.version);
     Ok(())
+}
+
+fn registry_arguments(
+    hive: &str,
+    key: &str,
+    name: &str,
+    value_type: &str,
+    value: &toml::Value,
+) -> Result<Vec<String>> {
+    let hive = match hive.to_ascii_uppercase().as_str() {
+        "HKCU" | "HKEY_CURRENT_USER" => "HKCU",
+        "HKLM" | "HKEY_LOCAL_MACHINE" => "HKLM",
+        "HKCR" | "HKEY_CLASSES_ROOT" => "HKCR",
+        "HKU" | "HKEY_USERS" => "HKU",
+        _ => bail!("unsupported registry hive: {hive}"),
+    };
+    if key.is_empty() || key.contains('\0') || name.contains('\0') {
+        bail!("registry key must be non-empty and registry inputs must be NUL-free");
+    }
+    let (registry_type, data) = match value_type {
+        "string" => (
+            "REG_SZ",
+            value
+                .as_str()
+                .context("registry string value must be a TOML string")?
+                .to_owned(),
+        ),
+        "dword" => {
+            let value = value
+                .as_integer()
+                .context("registry dword value must be a TOML integer")?;
+            let value = u32::try_from(value).context("registry dword must fit in u32")?;
+            ("REG_DWORD", value.to_string())
+        }
+        _ => bail!("unsupported registry valueType: {value_type}"),
+    };
+    let mut arguments = vec!["reg".to_owned(), "add".to_owned(), format!("{hive}\\{key}")];
+    if name.is_empty() {
+        arguments.push("/ve".to_owned());
+    } else {
+        arguments.extend(["/v".to_owned(), name.to_owned()]);
+    }
+    arguments.extend([
+        "/t".to_owned(),
+        registry_type.to_owned(),
+        "/d".to_owned(),
+        data,
+        "/f".to_owned(),
+    ]);
+    Ok(arguments)
 }
 
 fn copy_file(
@@ -855,6 +943,78 @@ mod tests {
             )
             .unwrap(),
             b"settings"
+        );
+    }
+
+    #[test]
+    fn registry_arguments_support_string_and_dword_values() {
+        assert_eq!(
+            registry_arguments(
+                "HKCU",
+                "Software\\Wine\\Mac Driver",
+                "RetinaMode",
+                "string",
+                &toml::Value::String("Y".into()),
+            )
+            .unwrap(),
+            [
+                "reg",
+                "add",
+                "HKCU\\Software\\Wine\\Mac Driver",
+                "/v",
+                "RetinaMode",
+                "/t",
+                "REG_SZ",
+                "/d",
+                "Y",
+                "/f",
+            ]
+        );
+        assert_eq!(
+            registry_arguments(
+                "HKEY_CURRENT_USER",
+                "Control Panel\\Desktop",
+                "LogPixels",
+                "dword",
+                &toml::Value::Integer(192),
+            )
+            .unwrap(),
+            [
+                "reg",
+                "add",
+                "HKCU\\Control Panel\\Desktop",
+                "/v",
+                "LogPixels",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "192",
+                "/f",
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_arguments_reject_unsupported_or_out_of_range_values() {
+        assert!(
+            registry_arguments(
+                "HKCC",
+                "Software\\Example",
+                "Value",
+                "string",
+                &toml::Value::String("value".into()),
+            )
+            .is_err()
+        );
+        assert!(
+            registry_arguments(
+                "HKCU",
+                "Software\\Example",
+                "Value",
+                "dword",
+                &toml::Value::Integer(-1),
+            )
+            .is_err()
         );
     }
 
