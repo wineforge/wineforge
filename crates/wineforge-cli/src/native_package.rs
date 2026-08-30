@@ -226,13 +226,23 @@ pub fn relink_macos_app(request: &RelinkRequest<'_>) -> Result<()> {
     require_regular_file(&engine_path, "engine manifest snapshot")?;
     let mut profile: ApplicationProfile = toml::from_str(&fs::read_to_string(&profile_path)?)
         .context("invalid packaged profile TOML")?;
-    let engine: EngineManifest = toml::from_str(&fs::read_to_string(&engine_path)?)
+    let mut engine: EngineManifest = toml::from_str(&fs::read_to_string(&engine_path)?)
         .context("invalid packaged engine manifest TOML")?;
     profile.validate().context("packaged profile is invalid")?;
     engine
         .validate()
         .context("packaged engine manifest is invalid")?;
     let resolved_root = resolved_engine_root(&engine, request.engine_root)?;
+    let managed_marker = read_managed_engine_marker(&resolved_root, &engine)?;
+    if let Some(digest) = managed_marker
+        .as_ref()
+        .and_then(|marker| marker.artifact_sha256.as_ref())
+    {
+        engine.artifact.sha256.0.clone_from(digest);
+        engine
+            .validate()
+            .context("managed engine produced an invalid refreshed manifest")?;
+    }
     let selection = profile.engines.get_mut(&engine.platform).with_context(|| {
         format!(
             "profile does not select an engine for {:?}",
@@ -251,7 +261,7 @@ pub fn relink_macos_app(request: &RelinkRequest<'_>) -> Result<()> {
     let use_shared = match request.distribution {
         EngineDistribution::Shared => true,
         EngineDistribution::Bundled => false,
-        EngineDistribution::Auto => is_managed_engine_root(&resolved_root, &engine)?,
+        EngineDistribution::Auto => managed_marker.is_some(),
     };
     if use_shared {
         selection.root = Some(resolved_root);
@@ -273,6 +283,7 @@ pub fn relink_macos_app(request: &RelinkRequest<'_>) -> Result<()> {
     let macos = contents.join("MacOS");
     replace_executable(request.wineforge_binary, &macos.join("wineforge"))?;
     replace_executable(request.launcher_binary, &macos.join("wineforge-launcher"))?;
+    write_toml_atomic(&engine_path, &engine)?;
     write_toml_atomic(&profile_path, &profile)?;
     if use_shared && fs::symlink_metadata(&embedded).is_ok() {
         require_real_directory(&embedded, "embedded engine")?;
@@ -488,6 +499,21 @@ fn resolve_package_engine(
 }
 
 fn is_managed_engine_root(root: &Path, engine: &EngineManifest) -> Result<bool> {
+    let Some(marker) = read_managed_engine_marker(root, engine)? else {
+        return Ok(false);
+    };
+    if let Some(digest) = marker.artifact_sha256 {
+        if digest != engine.artifact.sha256.0 {
+            bail!("managed engine digest does not match manifest");
+        }
+    }
+    Ok(true)
+}
+
+fn read_managed_engine_marker(
+    root: &Path,
+    engine: &EngineManifest,
+) -> Result<Option<EngineMarker>> {
     let marker_paths = [
         root.join(".wineforge-engine.json"),
         root.parent()
@@ -514,17 +540,9 @@ fn is_managed_engine_root(root: &Path, engine: &EngineManifest) -> Result<bool> 
                 marker_path.display()
             );
         }
-        if let Some(digest) = marker.artifact_sha256 {
-            if digest != engine.artifact.sha256.0 {
-                bail!(
-                    "engine marker digest does not match manifest: {}",
-                    marker_path.display()
-                );
-            }
-        }
-        return Ok(true);
+        return Ok(Some(marker));
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn deployed_profile(
@@ -1481,6 +1499,17 @@ mod tests {
                 PackageEngine::Bundled(_)
             ));
 
+            fs::write(
+                engine_root.join(".wineforge-engine.json"),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "engine",
+                    "id": engine.id.clone(),
+                    "artifact_sha256": "1".repeat(64),
+                })
+                .to_string(),
+            )
+            .unwrap();
             relink_macos_app(&RelinkRequest {
                 application: &app,
                 engine_root: &engine_root,
@@ -1493,6 +1522,11 @@ mod tests {
                 app.join("Contents/Frameworks/WineEngine/bin/wine")
                     .is_file()
             );
+            let refreshed_engine: EngineManifest = toml::from_str(
+                &fs::read_to_string(app.join("Contents/Resources/engine.toml")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(refreshed_engine.artifact.sha256.0, "1".repeat(64));
             relink_macos_app(&RelinkRequest {
                 application: &app,
                 engine_root: &engine_root,
