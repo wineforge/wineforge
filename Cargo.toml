@@ -3,7 +3,7 @@ members = ["crates/wineforge-core", "crates/wineforge-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wineforge/wineforge"
@@ -27,5 +27,5 @@ tar = "0.4"
 thiserror = "2.0"
 toml = "0.8"
 url = { version = "2.5", features = ["serde"] }
-wineforge-core = { path = "crates/wineforge-core", version = "0.1.2" }
+wineforge-core = { path = "crates/wineforge-core", version = "0.2.0" }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
