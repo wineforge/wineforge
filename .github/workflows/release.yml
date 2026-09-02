@@ -51,12 +51,34 @@ jobs:
           fi
           tar -C package -czf "wineforge-cli-$TARGET.tar.gz" wineforge wineforge-launcher
           shasum -a 256 "wineforge-cli-$TARGET.tar.gz" > "wineforge-cli-$TARGET.tar.gz.sha256"
+      - name: Stage SBOM inputs
+        run: |
+          mkdir -p sbom-input
+          cp Cargo.lock sbom-input/
+          cp package/wineforge package/wineforge-launcher sbom-input/
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: sbom-input
+          format: spdx-json
+          output-file: wineforge-cli-${{ matrix.target }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Validate SPDX document
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          jq -e '.spdxVersion == "SPDX-2.3" and .SPDXID == "SPDXRef-DOCUMENT" and (.packages | length > 0)' \
+            "wineforge-cli-$TARGET.spdx.json" > /dev/null
+          shasum -a 256 "wineforge-cli-$TARGET.spdx.json" > "wineforge-cli-$TARGET.spdx.json.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wineforge-cli-${{ matrix.target }}
           path: |
             wineforge-cli-${{ matrix.target }}.tar.gz
             wineforge-cli-${{ matrix.target }}.tar.gz.sha256
+            wineforge-cli-${{ matrix.target }}.spdx.json
+            wineforge-cli-${{ matrix.target }}.spdx.json.sha256
           if-no-files-found: error
 
   release:
