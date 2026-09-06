@@ -1357,10 +1357,12 @@ pub(crate) fn adopt_imported_instance(
 }
 
 fn prepare_private_runtime(profile: &ApplicationProfile) -> Result<()> {
+    let state = profile.prefix.join(".wineforge");
+    fs::create_dir_all(&state)
+        .with_context(|| format!("failed to create runtime state beneath {}", state.display()))?;
     if profile.isolation.mode == IsolationMode::Disabled {
         return Ok(());
     }
-    let state = profile.prefix.join(".wineforge");
     fs::create_dir_all(state.join("home"))
         .with_context(|| format!("failed to create private HOME beneath {}", state.display()))?;
     fs::create_dir_all(state.join("tmp")).with_context(|| {
@@ -1865,6 +1867,21 @@ mod tests {
             mappings: Vec::new(),
             isolation: wineforge_core::IsolationPolicy::default(),
         }
+    }
+
+    #[test]
+    fn disabled_isolation_still_creates_instance_state_directory() {
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        fs::create_dir(&prefix).unwrap();
+        let mut value = profile(&prefix);
+        value.isolation.mode = IsolationMode::Disabled;
+
+        prepare_private_runtime(&value).unwrap();
+
+        assert!(prefix.join(".wineforge").is_dir());
+        assert!(!prefix.join(".wineforge/home").exists());
+        assert!(!prefix.join(".wineforge/tmp").exists());
     }
 
     fn manifest(digest: String) -> EngineManifest {
