@@ -363,15 +363,20 @@ fn select_host_variant(recipe: &Recipe) -> Result<&Variant> {
     }
 }
 
+fn supported_engine_features(platform: Platform) -> BTreeSet<&'static str> {
+    match platform {
+        Platform::MacosX86_64 | Platform::LinuxX86_64 => BTreeSet::from(["win32", "win64"]),
+    }
+}
+
 fn validate_engine_requirement(variant: &Variant) -> Result<VersionReq> {
     match variant.engine.family.as_str() {
         "wine" | "winecx" => {}
         family => bail!("no trusted local builder is registered for engine family {family}"),
     }
-    let supported_features = match crate::current_platform()? {
-        Platform::MacosX86_64 => BTreeSet::from(["win32", "win64"]),
-        Platform::LinuxX86_64 => BTreeSet::from(["win64"]),
-    };
+    let platform = crate::current_platform()?;
+    let supported_features = supported_engine_features(platform);
+
     let unsupported = variant
         .engine
         .features
@@ -886,6 +891,13 @@ mod tests {
             Some(Version::new(25, 1, 1))
         );
         assert!(parse_engine_version("untrusted-25.1.1-macos-x86_64", "macos-x86_64").is_none());
+    }
+
+    #[test]
+    fn linux_engine_supports_native_32_and_64_bit_windows_apps() {
+        let features = supported_engine_features(Platform::LinuxX86_64);
+        assert!(features.contains("win32"));
+        assert!(features.contains("win64"));
     }
 
     #[test]
