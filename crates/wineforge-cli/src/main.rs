@@ -1153,11 +1153,15 @@ fn mapping_plan(profile: &ApplicationProfile) -> Result<wineforge_core::MappingP
 
 fn print_plan(profile: &ApplicationProfile) -> Result<()> {
     let plan = mapping_plan(profile)?;
-    if plan.actions.is_empty() {
+    let unexpected = unexpected_host_exposures(profile)?;
+    if plan.actions.is_empty() && unexpected.is_empty() {
         println!("unchanged: mappings already match the profile");
     } else {
         for action in plan.actions {
             print_action(action);
+        }
+        for exposure in unexpected {
+            println!("remove\thost integration {exposure}");
         }
     }
     Ok(())
@@ -1165,22 +1169,33 @@ fn print_plan(profile: &ApplicationProfile) -> Result<()> {
 
 fn apply_profile(profile: &ApplicationProfile, confirmed: bool) -> Result<()> {
     let plan = mapping_plan(profile)?;
-    if plan.actions.is_empty() {
+    let unexpected = unexpected_host_exposures(profile)?;
+    if plan.actions.is_empty() && unexpected.is_empty() {
         println!("unchanged: mappings already match the profile");
         return Ok(());
     }
     for action in &plan.actions {
         print_action(action.clone());
     }
+    for exposure in &unexpected {
+        println!("remove\thost integration {exposure}");
+    }
     if !confirmed {
         bail!("refusing mutation without --yes after reviewing the plan");
     }
-    let receipt = apply_mapping_plan(&profile.prefix, &plan)?;
-    println!(
-        "changed: drives {:?}; backup: {}",
-        receipt.changed_drives,
-        receipt.backup_directory.display()
-    );
+    if !plan.actions.is_empty() {
+        let receipt = apply_mapping_plan(&profile.prefix, &plan)?;
+        println!(
+            "changed: drives {:?}; backup: {}",
+            receipt.changed_drives,
+            receipt.backup_directory.display()
+        );
+    }
+    sanitize_profile(profile)?;
+    verify_host_exposure(profile)?;
+    if plan.actions.is_empty() {
+        println!("changed: removed undeclared host integrations");
+    }
     Ok(())
 }
 
@@ -1647,6 +1662,17 @@ fn verify_managed_instance(profile: &ApplicationProfile) -> Result<()> {
 }
 
 fn verify_host_exposure(profile: &ApplicationProfile) -> Result<()> {
+    let unexpected = unexpected_host_exposures(profile)?;
+    if !unexpected.is_empty() {
+        bail!(
+            "launch refused because the prefix exposes undeclared host paths: {}",
+            unexpected.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn unexpected_host_exposures(profile: &ApplicationProfile) -> Result<Vec<String>> {
     let allowed = profile
         .mappings
         .iter()
@@ -1658,19 +1684,12 @@ fn verify_host_exposure(profile: &ApplicationProfile) -> Result<()> {
                 .join(format!("{}:", drive.to_ascii_lowercase()))
         })
         .collect::<BTreeSet<_>>();
-    let unexpected = inspect_prefix(&profile.prefix)?
+    Ok(inspect_prefix(&profile.prefix)?
         .symlinks
         .into_iter()
         .filter(|item| item.escapes_prefix && !allowed.contains(&item.path))
         .map(|item| format!("{} -> {}", item.path.display(), item.target.display()))
-        .collect::<Vec<_>>();
-    if !unexpected.is_empty() {
-        bail!(
-            "launch refused because the prefix exposes undeclared host paths: {}",
-            unexpected.join(", ")
-        );
-    }
-    Ok(())
+        .collect::<Vec<_>>())
 }
 
 fn run_profile(
@@ -2238,6 +2257,27 @@ mod tests {
         });
 
         assert!(mapping_plan(&value).unwrap().actions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_removes_undeclared_host_link_when_drive_plan_is_unchanged() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(prefix.join("dosdevices")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let device_alias = prefix.join("dosdevices/d::");
+        symlink(&outside, &device_alias).unwrap();
+        let value = profile(&prefix);
+
+        assert!(mapping_plan(&value).unwrap().actions.is_empty());
+        apply_profile(&value, true).unwrap();
+
+        assert!(!device_alias.exists());
+        verify_host_exposure(&value).unwrap();
     }
 
     #[test]
