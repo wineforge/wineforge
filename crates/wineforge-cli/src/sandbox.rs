@@ -157,6 +157,13 @@ fn macos_policy(
     let readable = requirement(readable)?;
     let writable = requirement(writable)?;
     let mut policy = String::from("(version 1)\n(allow default)\n");
+    // Wine may discover volumes through macOS services and create X:: aliases
+    // inside its writable prefix. Never allow those aliases to provide raw disk
+    // access, independently of ordinary profile folder mappings.
+    policy.push_str(
+        "(deny file-read* (regex #\"^/dev/r?disk[0-9]+(s[0-9]+)?$\"))\n\
+         (deny file-write* (regex #\"^/dev/r?disk[0-9]+(s[0-9]+)?$\"))\n",
+    );
     for protected_root in ["/Users", "/Applications", "/Volumes", "/Network"] {
         policy.push_str(&format!(
             "(deny file-read-data (require-all (subpath \"{protected_root}\") (require-not {readable})))\n\
@@ -253,6 +260,7 @@ mod tests {
         assert!(policy.contains("/Applications"));
         assert!(policy.contains("/Volumes"));
         assert!(policy.contains("/Network"));
+        assert!(policy.contains("^/dev/r?disk[0-9]+(s[0-9]+)?$"));
         assert!(policy.contains("(deny file-write* (subpath \"/Users/example/read only\"))"));
     }
 

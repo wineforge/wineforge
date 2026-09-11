@@ -15,14 +15,7 @@ fn main() -> Result<()> {
         PackageKind::LinuxPackage => prepare_linux_profile(&layout)?,
     };
 
-    let mut command = Command::new(&layout.wineforge);
-    command
-        .arg("run")
-        .arg(profile)
-        .arg("--engine-manifest")
-        .arg(layout.engine_manifest)
-        .arg("--engine-root")
-        .arg(engine_root);
+    let mut command = wineforge_run_command(&layout, profile, engine_root);
 
     #[cfg(unix)]
     {
@@ -37,6 +30,23 @@ fn main() -> Result<()> {
             .context("failed to execute embedded Wineforge runtime")?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+fn wineforge_run_command(
+    layout: &PackageLayout,
+    profile: PathBuf,
+    engine_root: PathBuf,
+) -> Command {
+    let mut command = Command::new(&layout.wineforge);
+    command
+        .arg("run")
+        .arg(profile)
+        .arg("--engine-manifest")
+        .arg(&layout.engine_manifest)
+        .arg("--engine-root")
+        .arg(engine_root)
+        .arg("--apply");
+    command
 }
 
 fn prepare_macos_profile(layout: &PackageLayout) -> Result<PathBuf> {
@@ -403,5 +413,39 @@ url = "https://example.invalid/license"
         );
         write_profile("auto", None);
         assert_eq!(resolve_engine_root(&layout).unwrap(), embedded);
+    }
+
+    #[test]
+    fn native_launcher_reconciles_profile_before_every_run() {
+        let layout = PackageLayout {
+            kind: PackageKind::MacosApp,
+            root: PathBuf::from("/package"),
+            wineforge: PathBuf::from("/package/wineforge"),
+            profile_template: PathBuf::from("/package/profile.toml"),
+            engine_manifest: PathBuf::from("/package/engine.toml"),
+            embedded_engine_root: PathBuf::from("/package/engine"),
+        };
+        let command = wineforge_run_command(
+            &layout,
+            PathBuf::from("/instance/profile.toml"),
+            PathBuf::from("/shared/engine"),
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            [
+                "run",
+                "/instance/profile.toml",
+                "--engine-manifest",
+                "/package/engine.toml",
+                "--engine-root",
+                "/shared/engine",
+                "--apply",
+            ]
+        );
     }
 }
