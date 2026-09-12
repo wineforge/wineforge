@@ -295,6 +295,7 @@ fn configure_profile(
         environment: Environment::default(),
         mappings,
         isolation: IsolationPolicy::default(),
+        configuration: Default::default(),
     };
     profile.validate().context("generated profile is invalid")?;
     Ok(profile)
@@ -536,6 +537,8 @@ fn legacy_manifest(marker: &EngineMarker, platform: Platform) -> Result<EngineMa
             url: "https://www.codeweavers.com/crossover/source".parse()?,
             acceptance_required: false,
         },
+        capabilities: Default::default(),
+        composed_capabilities: Default::default(),
     })
 }
 
@@ -847,6 +850,8 @@ mod tests {
                 path: r"C:\Program Files\Example\editor.exe".into(),
                 sha256: None,
             }],
+            requirements: Default::default(),
+            configuration: Default::default(),
         }
     }
 
@@ -872,6 +877,8 @@ mod tests {
                 url: "https://example.invalid/license".parse().unwrap(),
                 acceptance_required: false,
             },
+            capabilities: Default::default(),
+            composed_capabilities: Default::default(),
         }
     }
 

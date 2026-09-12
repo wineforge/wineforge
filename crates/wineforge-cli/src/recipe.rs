@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use wineforge_core::{CapabilityRequirement, RecipeConfiguration};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -22,6 +23,17 @@ pub struct Recipe {
     pub sources: Vec<Source>,
     pub install: Vec<InstallStep>,
     pub verify: Vec<Postcondition>,
+    #[serde(default)]
+    pub requirements: RecipeRequirements,
+    #[serde(default)]
+    pub configuration: RecipeConfiguration,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecipeRequirements {
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityRequirement>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -239,6 +251,11 @@ impl Recipe {
             bail!("recipes require at least one variant and verification postcondition");
         }
         validate_windows_path(&self.application.executable, "application.executable")?;
+        wineforge_core::resolve_configuration(
+            &self.configuration,
+            &wineforge_core::ProfileConfiguration::default(),
+        )
+        .context("invalid recipe configuration")?;
 
         let mut source_ids = BTreeSet::new();
         for source in &self.sources {

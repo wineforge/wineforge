@@ -24,6 +24,8 @@ pub struct ApplicationProfile {
     /// Filesystem confinement applied to Wine and every child process.
     #[serde(default)]
     pub isolation: IsolationPolicy,
+    #[serde(default)]
+    pub configuration: crate::ProfileConfiguration,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +107,10 @@ pub struct EngineManifest {
     #[serde(default)]
     pub environment: Environment,
     pub license: License,
+    #[serde(default)]
+    pub capabilities: crate::CapabilitySet,
+    #[serde(default)]
+    pub composed_capabilities: crate::CapabilityCompositions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

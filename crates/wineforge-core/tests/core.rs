@@ -36,6 +36,7 @@ fn profile(prefix: &Path) -> ApplicationProfile {
             access: MappingAccess::ReadWrite,
         }],
         isolation: wineforge_core::IsolationPolicy::default(),
+        configuration: Default::default(),
     }
 }
 
@@ -154,6 +155,8 @@ fn engine_schema_and_validation_are_strict() {
             url: "https://example.invalid/license".parse().unwrap(),
             acceptance_required: false,
         },
+        capabilities: Default::default(),
+        composed_capabilities: Default::default(),
     };
     manifest.validate().unwrap();
     let mut invalid = manifest;

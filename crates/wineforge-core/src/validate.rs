@@ -326,6 +326,38 @@ impl Validate for EngineManifest {
         if self.license.name.trim().is_empty() {
             push(&mut errors, "license.name", "must not be blank");
         }
+        for (name, capability) in &self.capabilities.0 {
+            if !crate::valid_capability_name(name) {
+                push(
+                    &mut errors,
+                    format!("capabilities.{name}"),
+                    "invalid capability name",
+                );
+            }
+            if capability.version == 0 {
+                push(
+                    &mut errors,
+                    format!("capabilities.{name}.version"),
+                    "must be at least 1",
+                );
+            }
+        }
+        for (name, composition) in &self.composed_capabilities {
+            if !crate::valid_capability_name(name) {
+                push(
+                    &mut errors,
+                    format!("composed_capabilities.{name}"),
+                    "invalid capability name",
+                );
+            }
+            if composition.version == 0 {
+                push(
+                    &mut errors,
+                    format!("composed_capabilities.{name}.version"),
+                    "must be at least 1",
+                );
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {
