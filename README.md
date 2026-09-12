@@ -101,6 +101,10 @@ Recipes intentionally use **camelCase** keys. Profiles and engine manifests use
 [file-format reference](docs/file-formats.md) contains annotated examples and
 field tables.
 
+The [runtime-capabilities guide](docs/capabilities.md) covers versioned engine
+features, layered input policy, strict macOS window isolation, and MCP endpoint
+negotiation.
+
 ## Porting an application
 
 A typical port starts with a legally obtained installer, its SHA-256 digest,

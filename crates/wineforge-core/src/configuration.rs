@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ValidationError, ValidationErrors};
+use crate::{CapabilityProvider, CapabilityRequirement, ValidationError, ValidationErrors};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +13,8 @@ pub struct RecipeConfiguration {
     pub scrolling: ScrollingRecommendations,
     #[serde(default)]
     pub mcp: McpRecipeConfiguration,
+    #[serde(default)]
+    pub windowing: WindowingRecommendations,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +26,8 @@ pub struct ProfileConfiguration {
     pub scrolling: ScrollingProfileConfiguration,
     #[serde(default)]
     pub mcp: McpProfileConfiguration,
+    #[serde(default)]
+    pub windowing: WindowingProfileConfiguration,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +106,20 @@ pub struct KeyboardProfileConfiguration {
 #[serde(deny_unknown_fields)]
 pub struct ScrollingRecommendations {
     #[serde(default)]
+    pub settings: ScrollingSettings,
+    #[serde(default)]
     pub mappings: Vec<ScrollingMapping>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollingSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precise: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub momentum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizontal_with_shift: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,7 +162,11 @@ pub struct ScrollingOverride {
 #[serde(deny_unknown_fields)]
 pub struct ScrollingProfileConfiguration {
     #[serde(default = "enabled")]
+    pub recipe_settings: bool,
+    #[serde(default = "enabled")]
     pub recipe_mappings: bool,
+    #[serde(default)]
+    pub settings: ScrollingSettings,
     #[serde(default)]
     pub overrides: Vec<ScrollingOverride>,
     #[serde(default)]
@@ -155,9 +176,50 @@ pub struct ScrollingProfileConfiguration {
 impl Default for ScrollingProfileConfiguration {
     fn default() -> Self {
         Self {
+            recipe_settings: true,
             recipe_mappings: true,
+            settings: ScrollingSettings::default(),
             overrides: Vec::new(),
             mappings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MacosWindowIsolation {
+    Standard,
+    Strict,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowingRecommendations {
+    #[serde(default)]
+    pub macos: MacosWindowRecommendations,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacosWindowRecommendations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<MacosWindowIsolation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowingProfileConfiguration {
+    #[serde(default = "enabled")]
+    pub recipe_settings: bool,
+    #[serde(default)]
+    pub macos: MacosWindowRecommendations,
+}
+
+impl Default for WindowingProfileConfiguration {
+    fn default() -> Self {
+        Self {
+            recipe_settings: true,
+            macos: MacosWindowRecommendations::default(),
         }
     }
 }
@@ -231,8 +293,100 @@ pub struct EffectiveConfiguration {
     pub keyboard_preset: Option<KeyboardPreset>,
     pub keyboard_mappings: Vec<KeyboardMapping>,
     pub scrolling_mappings: Vec<ScrollingMapping>,
+    pub scrolling_settings: ScrollingSettings,
     pub mcp_endpoints: Vec<McpEndpoint>,
     pub mcp_bindings: Vec<McpBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_window_isolation: Option<MacosWindowIsolation>,
+}
+
+impl EffectiveConfiguration {
+    pub fn engine_requirements(&self) -> Vec<CapabilityRequirement> {
+        let mut names = BTreeSet::new();
+        if let Some(preset) = self.keyboard_preset {
+            match preset {
+                KeyboardPreset::Windows => {}
+                KeyboardPreset::MacNative => {
+                    names.insert("input.keyboard.preset.mac-native");
+                }
+                KeyboardPreset::Custom => {
+                    names.insert("input.keyboard.preset.custom");
+                }
+            }
+        }
+        if !self.keyboard_mappings.is_empty() {
+            names.insert("input.keyboard.mapping");
+        }
+        if !self.scrolling_mappings.is_empty() {
+            names.insert("input.scroll.keyboard-to-scroll");
+        }
+        if self
+            .scrolling_mappings
+            .iter()
+            .any(|mapping| mapping.action == ScrollAction::DragScroll)
+        {
+            names.insert("input.scroll.drag");
+        }
+        if self
+            .scrolling_mappings
+            .iter()
+            .any(|mapping| mapping.axis == Some(ScrollAxis::Horizontal))
+            || self.scrolling_settings.horizontal_with_shift == Some(true)
+        {
+            names.insert("input.scroll.horizontal");
+        }
+        if self.scrolling_settings.precise == Some(true) {
+            names.insert("input.scroll.precise");
+        }
+        if self.scrolling_settings.momentum == Some(true) {
+            names.insert("input.scroll.momentum");
+        }
+        if self.macos_window_isolation == Some(MacosWindowIsolation::Strict) {
+            names.insert("macos.window-isolation.strict");
+        }
+        names
+            .into_iter()
+            .map(|name| CapabilityRequirement {
+                name: name.into(),
+                minimum_version: 1,
+                provider: CapabilityProvider::Engine,
+            })
+            .collect()
+    }
+
+    /// Flatten resolved recipe/profile layers into a self-contained profile.
+    pub fn into_profile_configuration(self) -> ProfileConfiguration {
+        ProfileConfiguration {
+            keyboard: KeyboardProfileConfiguration {
+                recipe: RecipeLayerPolicy {
+                    preset: false,
+                    mappings: false,
+                },
+                preset: self.keyboard_preset,
+                overrides: Vec::new(),
+                mappings: self.keyboard_mappings,
+            },
+            scrolling: ScrollingProfileConfiguration {
+                recipe_settings: false,
+                recipe_mappings: false,
+                settings: self.scrolling_settings,
+                overrides: Vec::new(),
+                mappings: self.scrolling_mappings,
+            },
+            mcp: McpProfileConfiguration {
+                recipe_endpoints: false,
+                overrides: Vec::new(),
+                endpoints: self.mcp_endpoints,
+                bindings: self.mcp_bindings,
+            },
+            windowing: WindowingProfileConfiguration {
+                recipe_settings: false,
+                macos: MacosWindowRecommendations {
+                    isolation: self.macos_window_isolation,
+                },
+            },
+        }
+    }
 }
 
 pub fn resolve_configuration(
@@ -324,6 +478,33 @@ pub fn resolve_configuration(
         "configuration.scrolling",
         &mut errors,
     );
+    let scrolling_settings = ScrollingSettings {
+        precise: profile.scrolling.settings.precise.or_else(|| {
+            profile
+                .scrolling
+                .recipe_settings
+                .then_some(recipe.scrolling.settings.precise)
+                .flatten()
+        }),
+        momentum: profile.scrolling.settings.momentum.or_else(|| {
+            profile
+                .scrolling
+                .recipe_settings
+                .then_some(recipe.scrolling.settings.momentum)
+                .flatten()
+        }),
+        horizontal_with_shift: profile
+            .scrolling
+            .settings
+            .horizontal_with_shift
+            .or_else(|| {
+                profile
+                    .scrolling
+                    .recipe_settings
+                    .then_some(recipe.scrolling.settings.horizontal_with_shift)
+                    .flatten()
+            }),
+    };
 
     let mut endpoints = BTreeMap::new();
     if profile.mcp.recipe_endpoints {
@@ -375,12 +556,21 @@ pub fn resolve_configuration(
         }
     }
     if errors.is_empty() {
+        let macos_window_isolation = profile.windowing.macos.isolation.or_else(|| {
+            profile
+                .windowing
+                .recipe_settings
+                .then_some(recipe.windowing.macos.isolation)
+                .flatten()
+        });
         Ok(EffectiveConfiguration {
             keyboard_preset,
             keyboard_mappings: keyboard.into_values().collect(),
             scrolling_mappings: scrolling.into_values().collect(),
+            scrolling_settings,
             mcp_endpoints: endpoints.into_values().collect(),
             mcp_bindings: profile.mcp.bindings.clone(),
+            macos_window_isolation,
         })
     } else {
         Err(ValidationErrors(errors))

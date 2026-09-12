@@ -15,11 +15,12 @@ pub use capability::{
 };
 pub use configuration::{
     EffectiveConfiguration, KeyboardMapping, KeyboardOverride, KeyboardPreset,
-    KeyboardProfileConfiguration, KeyboardRecommendations, McpBinding, McpEndpoint,
-    McpEndpointOverride, McpProfileConfiguration, McpRecipeConfiguration, McpTransport,
-    ProfileConfiguration, RecipeConfiguration, RecipeLayerPolicy, ScrollAction, ScrollAxis,
-    ScrollingMapping, ScrollingOverride, ScrollingProfileConfiguration, ScrollingRecommendations,
-    resolve_configuration,
+    KeyboardProfileConfiguration, KeyboardRecommendations, MacosWindowIsolation,
+    MacosWindowRecommendations, McpBinding, McpEndpoint, McpEndpointOverride,
+    McpProfileConfiguration, McpRecipeConfiguration, McpTransport, ProfileConfiguration,
+    RecipeConfiguration, RecipeLayerPolicy, ScrollAction, ScrollAxis, ScrollingMapping,
+    ScrollingOverride, ScrollingProfileConfiguration, ScrollingRecommendations, ScrollingSettings,
+    WindowingProfileConfiguration, WindowingRecommendations, resolve_configuration,
 };
 pub use inspect::{Inspection, InspectionError, SymlinkFinding, inspect_prefix};
 pub use plan::{CurrentMapping, MappingAction, MappingPlan, plan_mappings};

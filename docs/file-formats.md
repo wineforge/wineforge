@@ -135,6 +135,40 @@ Profiles deliberately have no installation actions or Winetricks list. Put
 reproducible dependencies in the recipe; use `wineforge app provision` only for
 a local diagnostic adjustment.
 
+MCP endpoints declared by recipes remain symbolic. A profile may bind an
+endpoint to a machine-local registry name and request a restricted set of MCP
+operations:
+
+```toml
+[[configuration.mcp.bindings]]
+endpoint = "application-tools"
+server = "local-application-tools"
+permissions = ["tools.read", "tools.call"]
+```
+
+The corresponding trusted registry is not part of the recipe or profile. Its
+default location is `~/Library/Application Support/Wineforge/mcp-servers.toml`
+on macOS and `~/.config/wineforge/mcp-servers.toml` on Linux:
+
+```toml
+schema_version = 1
+
+[servers.local-application-tools]
+executable = "/absolute/path/to/application-tools-mcp"
+arguments = ["serve"]
+working_directory = "/absolute/path/to/allowed-workspace"
+permissions = ["tools.read", "tools.call"]
+max_message_bytes = 1048576
+idle_timeout_seconds = 300
+```
+
+The registry must be a regular file not writable by group or other users.
+Executables and working directories are absolute, arguments are passed without
+a shell, and a profile may request only permissions allowed by the registry.
+Recognized permissions are `tools.read`, `tools.call`, `resources.read`,
+`prompts.read`, and `completion.use`. Pass `--mcp-registry` to `wineforge run`
+to select a different trusted registry.
+
 An engine selection's `distribution` is `auto` by default. `auto` prefers the
 machine's shared engine, `shared` requires it, and `bundled` copies the engine
 into every native package. `prepare` records the verified absolute `root` for a

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use wineforge_core::{
     Capability, CapabilityComposition, CapabilityInventory, CapabilityProvider,
     CapabilityRequirement, CapabilitySet, KeyboardMapping, KeyboardOverride, KeyboardPreset,
-    McpBinding, McpEndpoint, McpTransport, ProfileConfiguration, RecipeConfiguration, ScrollAction,
-    ScrollAxis, ScrollingMapping, resolve_configuration,
+    MacosWindowIsolation, McpBinding, McpEndpoint, McpTransport, ProfileConfiguration,
+    RecipeConfiguration, ScrollAction, ScrollAxis, ScrollingMapping, resolve_configuration,
 };
 
 fn requirement(name: &str, provider: CapabilityProvider) -> CapabilityRequirement {
@@ -131,6 +131,22 @@ fn profile_disables_overrides_and_adds_recipe_configuration() {
 }
 
 #[test]
+fn materialized_profile_preserves_effective_recipe_configuration() {
+    let mut recipe = RecipeConfiguration::default();
+    recipe.keyboard.preset = Some(KeyboardPreset::MacNative);
+    recipe.scrolling.settings.precise = Some(true);
+    recipe.mcp.endpoints.push(McpEndpoint {
+        id: "application-tools".into(),
+        transport: McpTransport::Stdio,
+    });
+    recipe.windowing.macos.isolation = Some(wineforge_core::MacosWindowIsolation::Strict);
+    let effective = resolve_configuration(&recipe, &ProfileConfiguration::default()).unwrap();
+    let materialized = effective.clone().into_profile_configuration();
+    let reloaded = resolve_configuration(&RecipeConfiguration::default(), &materialized).unwrap();
+    assert_eq!(reloaded, effective);
+}
+
+#[test]
 fn bindings_cannot_target_undeclared_endpoints() {
     let mut profile = ProfileConfiguration::default();
     profile.mcp.bindings.push(McpBinding {
@@ -142,4 +158,68 @@ fn bindings_cannot_target_undeclared_endpoints() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("unknown endpoint missing"));
+}
+
+#[test]
+fn effective_configuration_requires_each_requested_engine_feature() {
+    let mut recipe = RecipeConfiguration::default();
+    recipe.keyboard.preset = Some(KeyboardPreset::MacNative);
+    recipe.keyboard.mappings.push(KeyboardMapping {
+        id: "copy".into(),
+        from: "command+c".into(),
+        to: "control+c".into(),
+    });
+    recipe.scrolling.settings.precise = Some(true);
+    recipe.scrolling.settings.momentum = Some(true);
+    recipe.scrolling.mappings.push(ScrollingMapping {
+        id: "pan".into(),
+        input: "space+pointer-drag".into(),
+        action: ScrollAction::DragScroll,
+        axis: Some(ScrollAxis::Horizontal),
+        amount: None,
+    });
+    recipe.windowing.macos.isolation = Some(MacosWindowIsolation::Strict);
+
+    let effective = resolve_configuration(&recipe, &ProfileConfiguration::default()).unwrap();
+    let names = effective
+        .engine_requirements()
+        .into_iter()
+        .map(|requirement| requirement.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "input.keyboard.mapping",
+            "input.keyboard.preset.mac-native",
+            "input.scroll.drag",
+            "input.scroll.horizontal",
+            "input.scroll.keyboard-to-scroll",
+            "input.scroll.momentum",
+            "input.scroll.precise",
+            "macos.window-isolation.strict",
+        ]
+    );
+}
+
+#[test]
+fn profile_can_disable_recipe_scroll_settings_and_window_isolation() {
+    let mut recipe = RecipeConfiguration::default();
+    recipe.scrolling.settings.precise = Some(true);
+    recipe.windowing.macos.isolation = Some(MacosWindowIsolation::Strict);
+    let mut profile = ProfileConfiguration::default();
+    profile.scrolling.recipe_settings = false;
+    profile.windowing.recipe_settings = false;
+
+    let effective = resolve_configuration(&recipe, &profile).unwrap();
+    assert_eq!(effective.scrolling_settings.precise, None);
+    assert_eq!(effective.macos_window_isolation, None);
+
+    profile.scrolling.settings.precise = Some(false);
+    profile.windowing.macos.isolation = Some(MacosWindowIsolation::Standard);
+    let effective = resolve_configuration(&recipe, &profile).unwrap();
+    assert_eq!(effective.scrolling_settings.precise, Some(false));
+    assert_eq!(
+        effective.macos_window_isolation,
+        Some(MacosWindowIsolation::Standard)
+    );
 }
