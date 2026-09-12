@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -19,6 +20,7 @@ use wineforge_core::{
 
 mod chocolatey;
 mod download;
+mod mcp_broker;
 mod native_package;
 mod prepare;
 mod recipe;
@@ -111,6 +113,11 @@ enum Command {
         #[command(subcommand)]
         command: RecipeCommand,
     },
+    /// Run explicitly authorized, application-scoped MCP forwarding.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Install a recipe as a registry-free native operating-system package.
     Install {
         recipe: PathBuf,
@@ -173,6 +180,49 @@ enum Command {
         /// Apply mapping changes before launch. Without this flag, drift fails closed.
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Forward one authenticated Unix-socket connection to a native stdio server.
+    #[cfg(unix)]
+    ForwardUnix {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Environment variable containing the per-launch authentication token.
+        #[arg(long, default_value = "WINEFORGE_MCP_TOKEN")]
+        token_env: String,
+        /// Absolute path to the native MCP server. No shell is used.
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long = "server-arg", allow_hyphen_values = true)]
+        server_arguments: Vec<String>,
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_message_bytes: usize,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
+    },
+    /// Forward one authenticated loopback TCP connection to a native stdio server.
+    ForwardTcp {
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Environment variable containing the per-launch authentication token.
+        #[arg(long, default_value = "WINEFORGE_MCP_TOKEN")]
+        token_env: String,
+        /// Absolute path to the native MCP server. No shell is used.
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long = "server-arg", allow_hyphen_values = true)]
+        server_arguments: Vec<String>,
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_message_bytes: usize,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
     },
 }
 
@@ -634,6 +684,50 @@ fn main() -> Result<()> {
                 yes,
             )?,
         },
+        Command::Mcp { command } => match command {
+            #[cfg(unix)]
+            McpCommand::ForwardUnix {
+                socket,
+                token_env,
+                executable,
+                server_arguments,
+                working_directory,
+                max_message_bytes,
+                idle_timeout_seconds,
+            } => {
+                let token = mcp_token(&token_env)?;
+                let server = mcp_broker::NativeServer {
+                    executable,
+                    arguments: server_arguments,
+                    working_directory,
+                    removed_environment: vec![token_env],
+                };
+                let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
+                mcp_broker::serve_unix_once(&socket, &token, &server, &limits)?;
+            }
+            McpCommand::ForwardTcp {
+                listen,
+                token_env,
+                executable,
+                server_arguments,
+                working_directory,
+                max_message_bytes,
+                idle_timeout_seconds,
+            } => {
+                if listen.port() == 0 {
+                    bail!("--listen must specify a nonzero port");
+                }
+                let token = mcp_token(&token_env)?;
+                let server = mcp_broker::NativeServer {
+                    executable,
+                    arguments: server_arguments,
+                    working_directory,
+                    removed_environment: vec![token_env],
+                };
+                let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
+                mcp_broker::serve_tcp_once(listen, &token, &server, &limits)?;
+            }
+        },
         Command::Install {
             recipe: recipe_path,
             profile: profile_path,
@@ -705,6 +799,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn mcp_token(variable: &str) -> Result<String> {
+    if variable.is_empty()
+        || !variable
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        bail!("MCP token environment variable must use uppercase ASCII, digits, and underscores");
+    }
+    std::env::var(variable)
+        .with_context(|| format!("MCP authentication token is not set in {variable}"))
+}
+
+fn mcp_limits(
+    max_message_bytes: usize,
+    idle_timeout_seconds: u64,
+) -> Result<mcp_broker::BrokerLimits> {
+    if !(256..=16 * 1024 * 1024).contains(&max_message_bytes) {
+        bail!("MCP maximum message size must be between 256 bytes and 16 MiB");
+    }
+    if !(1..=86_400).contains(&idle_timeout_seconds) {
+        bail!("MCP idle timeout must be between 1 second and 24 hours");
+    }
+    Ok(mcp_broker::BrokerLimits {
+        max_message_bytes,
+        idle_timeout: Duration::from_secs(idle_timeout_seconds),
+    })
+}
+
 fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bool) -> Result<()> {
     if !all && digests.is_empty() {
         bail!("select at least one --sha256 or pass --all");
@@ -768,10 +890,10 @@ fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bo
 }
 
 fn capability_inventory(manifest: &EngineManifest) -> Result<CapabilityInventory> {
-    let runtime = CapabilitySet(BTreeMap::from([(
-        "configuration.layering".into(),
-        Capability { version: 1 },
-    )]));
+    let runtime = CapabilitySet(BTreeMap::from([
+        ("configuration.layering".into(), Capability { version: 1 }),
+        ("mcp.broker".into(), Capability { version: 1 }),
+    ]));
     CapabilityInventory {
         engine: manifest.capabilities.clone(),
         runtime,
