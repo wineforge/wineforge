@@ -11,18 +11,27 @@ pub(crate) fn command(
     engine_root: &Path,
     executable: &Path,
 ) -> Result<Command> {
+    command_with_runtime_paths(profile, engine_root, executable, &[])
+}
+
+pub(crate) fn command_with_runtime_paths(
+    profile: &ApplicationProfile,
+    engine_root: &Path,
+    executable: &Path,
+    writable_runtime_paths: &[&Path],
+) -> Result<Command> {
     if profile.isolation.mode == IsolationMode::Disabled {
         return Ok(Command::new(executable));
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos_command(profile, engine_root, executable)
+        macos_command(profile, engine_root, executable, writable_runtime_paths)
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux_command(profile, engine_root, executable)
+        linux_command(profile, engine_root, executable, writable_runtime_paths)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -100,6 +109,7 @@ fn macos_command(
     profile: &ApplicationProfile,
     engine_root: &Path,
     executable: &Path,
+    writable_runtime_paths: &[&Path],
 ) -> Result<Command> {
     use std::os::unix::fs::MetadataExt;
 
@@ -116,6 +126,11 @@ fn macos_command(
     let mut readable = vec![prefix.clone(), engine.clone(), executable.clone()];
     let mut writable = vec![prefix.clone()];
     let mut read_only = Vec::new();
+    for path in writable_runtime_paths {
+        let path = canonical_directory(path, "runtime IPC")?;
+        readable.push(path.clone());
+        writable.push(path);
+    }
     for (path, access) in canonical_mappings(profile, &[&prefix, &engine, &executable])? {
         readable.push(path.clone());
         if access == MappingAccess::ReadWrite {
@@ -192,6 +207,7 @@ fn linux_command(
     profile: &ApplicationProfile,
     engine_root: &Path,
     executable: &Path,
+    writable_runtime_paths: &[&Path],
 ) -> Result<Command> {
     let bwrap = canonical_file(Path::new("bwrap"), "Bubblewrap executable")?;
     let prefix = canonical_directory(&profile.prefix, "prefix")?;
@@ -225,6 +241,10 @@ fn linux_command(
         command.arg("--ro-bind").arg(&executable).arg(&executable);
     }
     command.arg("--bind").arg(&prefix).arg(&prefix);
+    for path in writable_runtime_paths {
+        let path = canonical_directory(path, "runtime IPC")?;
+        command.arg("--bind").arg(&path).arg(&path);
+    }
     for (path, access) in canonical_mappings(profile, &[&prefix, &engine, &executable])? {
         command.arg(if access == MappingAccess::ReadOnly {
             "--ro-bind"

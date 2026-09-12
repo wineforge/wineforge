@@ -13,6 +13,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +48,8 @@ pub(crate) struct NativeServer {
     pub(crate) arguments: Vec<String>,
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) removed_environment: Vec<String>,
+    /// Authorized MCP permission categories. `*` is reserved for the explicit CLI.
+    pub(crate) permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +122,104 @@ impl Drop for SocketCleanup {
     }
 }
 
+/// A broker owned by one Wine application launch.
+#[cfg(unix)]
+pub(crate) struct RunningUnixBroker {
+    socket_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<UnixStream>>>,
+    worker: Option<thread::JoinHandle<Result<()>>>,
+}
+
+#[cfg(unix)]
+impl RunningUnixBroker {
+    pub(crate) fn start(
+        socket_path: PathBuf,
+        token: String,
+        server: NativeServer,
+        limits: BrokerLimits,
+    ) -> Result<Self> {
+        if socket_path.exists() {
+            bail!(
+                "refusing to replace existing socket {}",
+                socket_path.display()
+            );
+        }
+        let parent = socket_path
+            .parent()
+            .context("Unix socket path must have a parent directory")?;
+        fs::create_dir_all(parent)?;
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("could not bind MCP socket {}", socket_path.display()))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(None));
+        let worker_stop = Arc::clone(&stop);
+        let worker_active = Arc::clone(&active);
+        let cleanup_path = socket_path.clone();
+        let worker = thread::spawn(move || {
+            let result = loop {
+                if worker_stop.load(Ordering::Acquire) {
+                    break Ok(());
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(limits.idle_timeout))?;
+                        stream.set_write_timeout(Some(limits.idle_timeout))?;
+                        *worker_active.lock().expect("active MCP stream lock") =
+                            Some(stream.try_clone()?);
+                        let result = forward(stream, &token, &server, &limits);
+                        worker_active.lock().expect("active MCP stream lock").take();
+                        break result;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => break Err(error.into()),
+                }
+            };
+            let _ = fs::remove_file(cleanup_path);
+            result
+        });
+        Ok(Self {
+            socket_path,
+            stop,
+            active,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(stream) = self.active.lock().expect("active MCP stream lock").as_ref() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        // Wake a nonblocking listener before joining it.
+        let _ = UnixStream::connect(&self.socket_path);
+        let result = match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("MCP broker worker panicked"))?,
+            None => Ok(()),
+        };
+        let _ = fs::remove_file(&self.socket_path);
+        result
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<()> {
+        self.stop_and_join()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RunningUnixBroker {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
 fn configure_tcp(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
@@ -180,6 +285,7 @@ where
     let to_child = (|| -> Result<()> {
         let mut destination = BufWriter::new(child_stdin);
         while let Some(message) = read_json_line(&mut reader, max)? {
+            authorize_request(&message, &server.permissions)?;
             destination.write_all(&message)?;
             destination.flush()?;
         }
@@ -193,6 +299,39 @@ where
         .join()
         .map_err(|_| anyhow::anyhow!("native MCP output forwarding thread panicked"))?;
     to_child.and(from_child)
+}
+
+fn authorize_request(message: &[u8], permissions: &[String]) -> Result<()> {
+    if permissions.iter().any(|value| value == "*") {
+        return Ok(());
+    }
+    let value: Value = serde_json::from_slice(message)?;
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        // JSON-RPC responses do not carry a method and are safe to relay.
+        return Ok(());
+    };
+    let base_method = matches!(
+        method,
+        "initialize" | "notifications/initialized" | "ping" | "notifications/cancelled"
+    );
+    let permitted = base_method
+        || permissions
+            .iter()
+            .any(|permission| match permission.as_str() {
+                "tools.read" => method == "tools/list",
+                "tools.call" => method == "tools/call",
+                "resources.read" => matches!(
+                    method,
+                    "resources/list" | "resources/read" | "resources/templates/list"
+                ),
+                "prompts.read" => matches!(method, "prompts/list" | "prompts/get"),
+                "completion.use" => method == "completion/complete",
+                _ => false,
+            });
+    if !permitted {
+        bail!("MCP method {method} is not authorized for this application binding");
+    }
+    Ok(())
 }
 
 fn authenticate<R: BufRead>(reader: &mut R, expected: &str, max: usize) -> Result<()> {
@@ -305,6 +444,7 @@ mod tests {
             arguments: vec![],
             working_directory: None,
             removed_environment: vec![],
+            permissions: vec!["*".into()],
         };
         let error = serve_tcp_once(
             SocketAddr::new(std::net::IpAddr::from([0, 0, 0, 0]), 0),
@@ -314,5 +454,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn application_permissions_restrict_forwarded_methods() {
+        let list = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        authorize_request(list, &["tools.read".into()]).unwrap();
+        let call = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#;
+        let error = authorize_request(call, &["tools.read".into()]).unwrap_err();
+        assert!(error.to_string().contains("not authorized"));
     }
 }

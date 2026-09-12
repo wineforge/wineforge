@@ -277,7 +277,7 @@ fn configure_profile(
         );
     }
 
-    let profile = ApplicationProfile {
+    let mut profile = ApplicationProfile {
         schema_version: 1,
         id,
         name,
@@ -297,6 +297,12 @@ fn configure_profile(
         isolation: IsolationPolicy::default(),
         configuration: Default::default(),
     };
+    profile.configuration = wineforge_core::resolve_configuration(
+        &request.recipe.configuration,
+        &profile.configuration,
+    )
+    .context("recipe configuration cannot be materialized")?
+    .into_profile_configuration();
     profile.validate().context("generated profile is invalid")?;
     Ok(profile)
 }
@@ -975,7 +981,10 @@ mod tests {
     #[test]
     fn profile_configuration_is_derived_from_recipe_and_local_answers() {
         let temp = tempdir().unwrap();
-        let recipe = recipe();
+        let mut recipe = recipe();
+        recipe.configuration.keyboard.preset = Some(wineforge_core::KeyboardPreset::MacNative);
+        recipe.configuration.windowing.macos.isolation =
+            Some(wineforge_core::MacosWindowIsolation::Strict);
         let request = PrepareRequest {
             recipe: &recipe,
             profile_out: &temp.path().join("profile.toml"),
@@ -1004,6 +1013,16 @@ mod tests {
         assert_eq!(profile.executable, recipe.application.executable);
         assert_eq!(profile.arguments, recipe.application.arguments);
         assert_eq!(profile.mappings.len(), 1);
+        assert_eq!(
+            profile.configuration.keyboard.preset,
+            Some(wineforge_core::KeyboardPreset::MacNative)
+        );
+        assert!(!profile.configuration.keyboard.recipe.preset);
+        assert_eq!(
+            profile.configuration.windowing.macos.isolation,
+            Some(wineforge_core::MacosWindowIsolation::Strict)
+        );
+        assert!(!profile.configuration.windowing.recipe_settings);
         assert_eq!(
             profile.engines[&crate::current_platform().unwrap()].id,
             "example-engine"

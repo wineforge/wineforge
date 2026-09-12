@@ -21,6 +21,7 @@ use wineforge_core::{
 mod chocolatey;
 mod download;
 mod mcp_broker;
+mod mcp_registry;
 mod native_package;
 mod prepare;
 mod recipe;
@@ -180,6 +181,9 @@ enum Command {
         /// Apply mapping changes before launch. Without this flag, drift fails closed.
         #[arg(long)]
         apply: bool,
+        /// Trusted machine-local registry for symbolic MCP server bindings.
+        #[arg(long)]
+        mcp_registry: Option<PathBuf>,
     },
 }
 
@@ -535,8 +539,11 @@ fn main() -> Result<()> {
                 launcher_binary,
             } => {
                 let recipe_value = recipe::read(&recipe)?;
-                let profile_value = read_profile(&profile)?;
+                let mut profile_value = read_profile(&profile)?;
                 let engine = read_engine(&engine_manifest)?;
+                profile_value.configuration =
+                    resolve_recipe_profile(&recipe_value, &profile_value, &engine)?
+                        .into_profile_configuration();
                 let current_executable =
                     std::env::current_exe().context("failed to locate the Wineforge executable")?;
                 let wineforge_binary =
@@ -701,6 +708,7 @@ fn main() -> Result<()> {
                     arguments: server_arguments,
                     working_directory,
                     removed_environment: vec![token_env],
+                    permissions: vec!["*".into()],
                 };
                 let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
                 mcp_broker::serve_unix_once(&socket, &token, &server, &limits)?;
@@ -723,6 +731,7 @@ fn main() -> Result<()> {
                     arguments: server_arguments,
                     working_directory,
                     removed_environment: vec![token_env],
+                    permissions: vec!["*".into()],
                 };
                 let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
                 mcp_broker::serve_tcp_once(listen, &token, &server, &limits)?;
@@ -789,11 +798,13 @@ fn main() -> Result<()> {
             engine_manifest,
             engine_root,
             apply,
+            mcp_registry,
         } => run_profile(
             &read_profile(&profile)?,
             &read_engine(&engine_manifest)?,
             &engine_root,
             apply,
+            mcp_registry.as_deref(),
         )?,
     }
     Ok(())
@@ -912,20 +923,7 @@ fn resolve_recipe_profile(
         wineforge_core::resolve_configuration(&recipe.configuration, &profile.configuration)
             .context("recipe/profile configuration cannot be resolved")?;
     let mut requirements = recipe.requirements.capabilities.clone();
-    if effective.keyboard_preset.is_some() || !effective.keyboard_mappings.is_empty() {
-        requirements.push(CapabilityRequirement {
-            name: "input.keyboard".into(),
-            minimum_version: 1,
-            provider: CapabilityProvider::Engine,
-        });
-    }
-    if !effective.scrolling_mappings.is_empty() {
-        requirements.push(CapabilityRequirement {
-            name: "input.scrolling".into(),
-            minimum_version: 1,
-            provider: CapabilityProvider::Engine,
-        });
-    }
+    requirements.extend(effective.engine_requirements());
     if !effective.mcp_endpoints.is_empty() {
         requirements.push(CapabilityRequirement {
             name: "mcp.forwarding".into(),
@@ -963,9 +961,11 @@ fn install_native_package(
     launcher_binary: Option<PathBuf>,
     accept_license: bool,
 ) -> Result<()> {
-    resolve_recipe_profile(recipe, profile, engine)?;
+    let effective = resolve_recipe_profile(recipe, profile, engine)?;
+    let mut materialized_profile = profile.clone();
+    materialized_profile.configuration = effective.into_profile_configuration();
     let destination = destination.map_or_else(
-        || native_package::default_destination(format, recipe, profile),
+        || native_package::default_destination(format, recipe, &materialized_profile),
         Ok,
     )?;
     let current_executable =
@@ -976,7 +976,7 @@ fn install_native_package(
     native_package::install(&native_package::InstallRequest {
         recipe,
         recipe_path,
-        profile,
+        profile: &materialized_profile,
         engine,
         engine_root,
         destination: &destination,
@@ -1902,6 +1902,7 @@ fn run_profile(
     engine: &EngineManifest,
     engine_root: &Path,
     apply: bool,
+    mcp_registry_path: Option<&Path>,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
     if fs::symlink_metadata(&profile.prefix).is_err() {
@@ -1915,18 +1916,273 @@ fn run_profile(
     }
     verify_host_exposure(profile)?;
     prepare_private_runtime(profile)?;
+    validate_profile_runtime_capabilities(profile, engine)?;
     let wine = engine_wine(engine, engine_root)?;
-    let mut command = sandbox::command(profile, engine_root, &wine)?;
+    let mut mcp = start_profile_mcp(profile, mcp_registry_path)?;
+    #[cfg(unix)]
+    let runtime_paths = mcp
+        .as_ref()
+        .map(|runtime| vec![runtime.directory.as_path()])
+        .unwrap_or_default();
+    #[cfg(not(unix))]
+    let runtime_paths = Vec::<&Path>::new();
+    let mut command =
+        sandbox::command_with_runtime_paths(profile, engine_root, &wine, &runtime_paths)?;
     command.arg(&profile.executable).args(&profile.arguments);
     command.current_dir(profile.prefix.join("drive_c"));
     add_wine_environment(&mut command, profile, engine);
-    let status = command
+    add_resolved_runtime_environment(&mut command, profile)?;
+    #[cfg(unix)]
+    if let Some(runtime) = &mcp {
+        command.env("WINEFORGE_MCP_CONFIG", &runtime.config_path);
+    }
+    let launch_result = command
         .status()
-        .with_context(|| format!("failed to launch {}", wine.display()))?;
+        .with_context(|| format!("failed to launch {}", wine.display()));
+    #[cfg(unix)]
+    let shutdown_result = match mcp.take() {
+        Some(runtime) => runtime.shutdown(),
+        None => Ok(()),
+    };
+    let status = launch_result?;
+    #[cfg(unix)]
+    shutdown_result?;
     if !status.success() {
         bail!("Wine process exited with {status}");
     }
     Ok(())
+}
+
+fn add_resolved_runtime_environment(
+    command: &mut ProcessCommand,
+    profile: &ApplicationProfile,
+) -> Result<()> {
+    let effective = wineforge_core::resolve_configuration(
+        &wineforge_core::RecipeConfiguration::default(),
+        &profile.configuration,
+    )
+    .context("self-contained profile configuration cannot be resolved")?;
+    if effective.keyboard_preset == Some(wineforge_core::KeyboardPreset::MacNative) {
+        command
+            .env("WINEFORGE_INPUT_LEFT_COMMAND_IS_CTRL", "true")
+            .env("WINEFORGE_INPUT_RIGHT_COMMAND_IS_CTRL", "true")
+            .env("WINEFORGE_INPUT_LEFT_OPTION_IS_ALT", "true")
+            .env("WINEFORGE_INPUT_RIGHT_OPTION_IS_ALT", "true");
+    }
+    if let Some(precise) = effective.scrolling_settings.precise {
+        command.env(
+            "WINEFORGE_INPUT_PRECISE_SCROLLING",
+            if precise { "true" } else { "false" },
+        );
+    }
+    if effective.macos_window_isolation == Some(wineforge_core::MacosWindowIsolation::Strict) {
+        command.env("WINEFORGE_STRICT_WINDOW_ISOLATION", "true");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Deserialize, Serialize)]
+struct McpRuntimeConfiguration {
+    schema_version: u32,
+    endpoints: Vec<McpRuntimeEndpoint>,
+}
+
+#[cfg(unix)]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct McpRuntimeEndpoint {
+    id: String,
+    transport: String,
+    address: PathBuf,
+    token: String,
+}
+
+#[cfg(unix)]
+struct ProfileMcpRuntime {
+    directory: PathBuf,
+    config_path: PathBuf,
+    brokers: Vec<mcp_broker::RunningUnixBroker>,
+}
+
+#[cfg(unix)]
+impl Drop for ProfileMcpRuntime {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(unix)]
+impl ProfileMcpRuntime {
+    fn shutdown(mut self) -> Result<()> {
+        let mut first_error = None;
+        while let Some(broker) = self.brokers.pop() {
+            if let Err(error) = broker.shutdown() {
+                first_error.get_or_insert(error);
+            }
+        }
+        if self.directory.exists() {
+            fs::remove_dir_all(&self.directory)?;
+        }
+        if let Some(error) = first_error {
+            return Err(error).context("MCP broker shutdown failed");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn start_profile_mcp(
+    profile: &ApplicationProfile,
+    registry_path: Option<&Path>,
+) -> Result<Option<ProfileMcpRuntime>> {
+    start_profile_mcp_at(profile, registry_path, &std::env::temp_dir())
+}
+
+#[cfg(unix)]
+fn start_profile_mcp_at(
+    profile: &ApplicationProfile,
+    registry_path: Option<&Path>,
+    ipc_root: &Path,
+) -> Result<Option<ProfileMcpRuntime>> {
+    let nonce = secure_mcp_token()?;
+    let directory = ipc_root.join(format!("wf-mcp-{}-{}", std::process::id(), &nonce[..8]));
+    start_profile_mcp_in(profile, registry_path, directory)
+}
+
+#[cfg(unix)]
+fn start_profile_mcp_in(
+    profile: &ApplicationProfile,
+    registry_path: Option<&Path>,
+    directory: PathBuf,
+) -> Result<Option<ProfileMcpRuntime>> {
+    let bindings = &profile.configuration.mcp.bindings;
+    if bindings.is_empty() {
+        return Ok(None);
+    }
+    for binding in bindings {
+        let endpoint = profile
+            .configuration
+            .mcp
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == binding.endpoint)
+            .with_context(|| {
+                format!(
+                    "MCP binding {} has no materialized endpoint",
+                    binding.endpoint
+                )
+            })?;
+        if endpoint.transport != wineforge_core::McpTransport::Stdio {
+            bail!(
+                "automatic MCP forwarding currently supports only stdio endpoints; {} uses {:?}",
+                endpoint.id,
+                endpoint.transport
+            );
+        }
+    }
+    let registry_path = match registry_path {
+        Some(path) => path.to_path_buf(),
+        None => mcp_registry::default_path()?,
+    };
+    let registry = mcp_registry::read(&registry_path)?;
+    let resolved = mcp_registry::resolve(&registry, bindings, "WINEFORGE_MCP_TOKEN")?;
+    fs::create_dir(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let result = (|| -> Result<ProfileMcpRuntime> {
+        let mut brokers = Vec::new();
+        let mut endpoints = Vec::new();
+        for (index, server) in resolved.into_iter().enumerate() {
+            let token = secure_mcp_token()?;
+            let socket = directory.join(format!("endpoint-{index}.sock"));
+            brokers.push(mcp_broker::RunningUnixBroker::start(
+                socket.clone(),
+                token.clone(),
+                server.native,
+                server.limits,
+            )?);
+            endpoints.push(McpRuntimeEndpoint {
+                id: server.endpoint,
+                transport: "unix-socket".into(),
+                address: socket,
+                token,
+            });
+        }
+        let config_path = directory.join("runtime.toml");
+        fs::write(
+            &config_path,
+            toml::to_string(&McpRuntimeConfiguration {
+                schema_version: 1,
+                endpoints,
+            })?,
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        Ok(ProfileMcpRuntime {
+            directory: directory.clone(),
+            config_path,
+            brokers,
+        })
+    })();
+    if result.is_err() && directory.exists() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result.map(Some)
+}
+
+fn validate_profile_runtime_capabilities(
+    profile: &ApplicationProfile,
+    engine: &EngineManifest,
+) -> Result<()> {
+    let effective = wineforge_core::resolve_configuration(
+        &wineforge_core::RecipeConfiguration::default(),
+        &profile.configuration,
+    )
+    .context("self-contained profile configuration cannot be resolved")?;
+    let mut requirements = effective.engine_requirements();
+    if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.forwarding".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Composed,
+        });
+    }
+    capability_inventory(engine)?
+        .satisfy(&requirements)
+        .context("profile runtime capabilities are not satisfied")
+}
+
+#[cfg(not(unix))]
+fn start_profile_mcp(
+    profile: &ApplicationProfile,
+    _registry_path: Option<&Path>,
+) -> Result<Option<()>> {
+    if !profile.configuration.mcp.bindings.is_empty() {
+        bail!("automatic MCP forwarding currently requires a Unix host");
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn secure_mcp_token() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")
+        .context("could not open the operating-system random source")?
+        .read_exact(&mut bytes)
+        .context("could not read the operating-system random source")?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(token)
 }
 
 #[cfg(target_os = "macos")]
@@ -2145,6 +2401,30 @@ mod tests {
                 .next()
                 .is_some_and(|path| path == bin)
         );
+    }
+
+    #[test]
+    fn resolved_profile_sets_supported_engine_environment() {
+        let temp = tempdir().unwrap();
+        let mut value = profile(&temp.path().join("prefix"));
+        value.configuration.keyboard.preset = Some(wineforge_core::KeyboardPreset::MacNative);
+        value.configuration.scrolling.settings.precise = Some(true);
+        value.configuration.windowing.macos.isolation =
+            Some(wineforge_core::MacosWindowIsolation::Strict);
+        let mut command = ProcessCommand::new("ignored");
+        add_resolved_runtime_environment(&mut command, &value).unwrap();
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(environment["WINEFORGE_INPUT_LEFT_COMMAND_IS_CTRL"], "true");
+        assert_eq!(environment["WINEFORGE_INPUT_PRECISE_SCROLLING"], "true");
+        assert_eq!(environment["WINEFORGE_STRICT_WINDOW_ISOLATION"], "true");
     }
 
     #[test]
@@ -2611,6 +2891,83 @@ mod tests {
         let result = prune_engines(&store, &[], true, &[], true);
         assert!(result.is_err());
         assert!(directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_binding_starts_authenticated_broker_and_cleans_up() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        fs::create_dir(&prefix).unwrap();
+        let registry_path = temp.path().join("mcp-servers.toml");
+        let registry = mcp_registry::ServerRegistry {
+            schema_version: 1,
+            servers: BTreeMap::from([(
+                "echo".into(),
+                mcp_registry::RegisteredServer {
+                    executable: PathBuf::from("/bin/cat"),
+                    arguments: vec![],
+                    working_directory: None,
+                    permissions: vec!["tools.read".into()],
+                    max_message_bytes: 4096,
+                    idle_timeout_seconds: 5,
+                },
+            )]),
+        };
+        fs::write(&registry_path, toml::to_string(&registry).unwrap()).unwrap();
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut value = profile(&prefix);
+        value
+            .configuration
+            .mcp
+            .endpoints
+            .push(wineforge_core::McpEndpoint {
+                id: "app-tools".into(),
+                transport: wineforge_core::McpTransport::Stdio,
+            });
+        value
+            .configuration
+            .mcp
+            .bindings
+            .push(wineforge_core::McpBinding {
+                endpoint: "app-tools".into(),
+                server: "echo".into(),
+                permissions: vec!["tools.read".into()],
+            });
+
+        let runtime = start_profile_mcp_in(&value, Some(&registry_path), temp.path().join("m"))
+            .unwrap()
+            .unwrap();
+        let config: McpRuntimeConfiguration = read_config(&runtime.config_path).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        let endpoint = &config.endpoints[0];
+        let mut stream = UnixStream::connect(&endpoint.address).unwrap();
+        writeln!(
+            stream,
+            r#"{{"protocol":"wineforge-mcp-forward/1","token":"{}"}}"#,
+            endpoint.token
+        )
+        .unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        writeln!(stream, "{request}").unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        if response.is_empty() {
+            drop(stream);
+            panic!("broker ended before response: {:?}", runtime.shutdown());
+        }
+        assert_eq!(response.trim_end(), request);
+        drop(stream);
+        let directory = runtime.directory.clone();
+        runtime.shutdown().unwrap();
+        assert!(!directory.exists());
     }
 
     #[test]

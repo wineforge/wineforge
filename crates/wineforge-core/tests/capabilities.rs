@@ -131,6 +131,22 @@ fn profile_disables_overrides_and_adds_recipe_configuration() {
 }
 
 #[test]
+fn materialized_profile_preserves_effective_recipe_configuration() {
+    let mut recipe = RecipeConfiguration::default();
+    recipe.keyboard.preset = Some(KeyboardPreset::MacNative);
+    recipe.scrolling.settings.precise = Some(true);
+    recipe.mcp.endpoints.push(McpEndpoint {
+        id: "application-tools".into(),
+        transport: McpTransport::Stdio,
+    });
+    recipe.windowing.macos.isolation = Some(wineforge_core::MacosWindowIsolation::Strict);
+    let effective = resolve_configuration(&recipe, &ProfileConfiguration::default()).unwrap();
+    let materialized = effective.clone().into_profile_configuration();
+    let reloaded = resolve_configuration(&RecipeConfiguration::default(), &materialized).unwrap();
+    assert_eq!(reloaded, effective);
+}
+
+#[test]
 fn bindings_cannot_target_undeclared_endpoints() {
     let mut profile = ProfileConfiguration::default();
     profile.mcp.bindings.push(McpBinding {

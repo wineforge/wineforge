@@ -353,6 +353,40 @@ impl EffectiveConfiguration {
             })
             .collect()
     }
+
+    /// Flatten resolved recipe/profile layers into a self-contained profile.
+    pub fn into_profile_configuration(self) -> ProfileConfiguration {
+        ProfileConfiguration {
+            keyboard: KeyboardProfileConfiguration {
+                recipe: RecipeLayerPolicy {
+                    preset: false,
+                    mappings: false,
+                },
+                preset: self.keyboard_preset,
+                overrides: Vec::new(),
+                mappings: self.keyboard_mappings,
+            },
+            scrolling: ScrollingProfileConfiguration {
+                recipe_settings: false,
+                recipe_mappings: false,
+                settings: self.scrolling_settings,
+                overrides: Vec::new(),
+                mappings: self.scrolling_mappings,
+            },
+            mcp: McpProfileConfiguration {
+                recipe_endpoints: false,
+                overrides: Vec::new(),
+                endpoints: self.mcp_endpoints,
+                bindings: self.mcp_bindings,
+            },
+            windowing: WindowingProfileConfiguration {
+                recipe_settings: false,
+                macos: MacosWindowRecommendations {
+                    isolation: self.macos_window_isolation,
+                },
+            },
+        }
+    }
 }
 
 pub fn resolve_configuration(

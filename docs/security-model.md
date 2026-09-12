@@ -81,11 +81,14 @@ JSON-RPC objects to one native stdio server.
 - Message sizes and idle time are bounded, and the native child is terminated
   when its application connection ends.
 
-Recipe MCP endpoints remain symbolic. A future trusted local server registry
-will bind those names to executable paths; recipes must never choose arbitrary
-host commands. MCP forwarding intentionally crosses the Wine isolation boundary
-and does not itself grant filesystem or network access beyond the selected MCP
-server's own permissions.
+Recipe MCP endpoints remain symbolic. A trusted local server registry
+binds those names to executable paths; recipes never choose arbitrary host
+commands. Profile-requested MCP method categories must also be allowed by that
+registry and are enforced before each request reaches native stdio. The runtime
+configuration and random per-endpoint tokens are stored in an owner-only
+per-launch directory and removed when Wine exits. MCP forwarding intentionally
+crosses the Wine isolation boundary and does not itself grant filesystem or
+network access beyond the selected MCP server's own permissions.
 
 ## Chocolatey translation
 
