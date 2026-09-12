@@ -14,7 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install 1.85.0 --profile minimal
-      - run: cargo +1.85.0 build --locked --release -p wineforge-mcp-bridge
+      - name: Build statically linked Windows bridge
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo +1.85.0 build --locked --release -p wineforge-mcp-bridge
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wineforge-mcp-bridge-windows

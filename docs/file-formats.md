@@ -213,6 +213,10 @@ acceptance_required = false
 | `[artifact.source]` | Artifact provenance |
 | `[environment]` | Engine-required environment variables |
 | `[license]` | License name, URL, and whether explicit acceptance is required |
+| `[capabilities]` | Optional typed runtime attestation; its structure must exactly match `share/wineforge/capabilities.json` in the installed engine |
+
+See [Runtime capabilities](capabilities.md) for the versioned document schema,
+validation rules, and legacy capability-empty behavior.
 
 Artifact source forms are:
 

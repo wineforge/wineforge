@@ -907,7 +907,11 @@ fn capability_inventory(manifest: &EngineManifest) -> Result<CapabilityInventory
         ("mcp.bridge".into(), Capability { version: 1 }),
     ]));
     CapabilityInventory {
-        engine: manifest.capabilities.clone(),
+        engine: manifest
+            .capabilities
+            .as_ref()
+            .map(wineforge_core::EngineCapabilityDocument::provided_set)
+            .unwrap_or_default(),
         runtime,
         composed: CapabilitySet::default(),
     }
@@ -1014,6 +1018,9 @@ pub(crate) fn install_engine(
     manifest: &EngineManifest,
     destination: &Path,
 ) -> Result<()> {
+    manifest
+        .validate()
+        .context("engine manifest validation failed")?;
     if destination.exists() {
         bail!("destination already exists: {}", destination.display());
     }
@@ -1049,6 +1056,10 @@ pub(crate) fn install_engine(
             "archive did not contain the declared Wine executable: {}",
             wine.display()
         );
+    }
+    if let Err(error) = attest_engine_capabilities(manifest, &engine_root) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error.context("installed engine capability attestation failed"));
     }
     let marker = ManagedEntry {
         schema_version: 1,
@@ -1460,6 +1471,44 @@ pub(crate) fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result
     Ok(canonical_wine)
 }
 
+fn attest_engine_capabilities(engine: &EngineManifest, engine_root: &Path) -> Result<()> {
+    const MAX_CAPABILITY_DOCUMENT_BYTES: u64 = 1024 * 1024;
+    let root = resolved_engine_root(engine, engine_root)?;
+    let path = root.join("share/wineforge/capabilities.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    match (&engine.capabilities, metadata) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => bail!(
+            "engine contains capability metadata but its manifest does not: {}",
+            path.display()
+        ),
+        (Some(_), None) => bail!(
+            "engine manifest declares capabilities but installed metadata is missing: {}",
+            path.display()
+        ),
+        (Some(expected), Some(metadata)) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > MAX_CAPABILITY_DOCUMENT_BYTES
+            {
+                bail!("engine capability metadata must be a small regular file");
+            }
+            let bytes = fs::read(&path)?;
+            let actual: wineforge_core::EngineCapabilityDocument =
+                serde_json::from_slice(&bytes)
+                    .context("invalid installed engine capability metadata")?;
+            if &actual != expected {
+                bail!("installed engine capability metadata does not match its manifest");
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn shutdown_wineserver(
     profile: &ApplicationProfile,
     engine: &EngineManifest,
@@ -1550,6 +1599,8 @@ pub(crate) fn adopt_imported_instance(
     engine_root: &Path,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
+    attest_engine_capabilities(engine, engine_root)
+        .context("engine capability attestation failed before launch")?;
     sanitize_prefix(&profile.prefix)?;
     prepare_private_runtime(profile)?;
     apply_profile(profile, true)?;
@@ -1911,6 +1962,8 @@ fn run_profile(
     mcp_registry_path: Option<&Path>,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
+    attest_engine_capabilities(engine, engine_root)
+        .context("engine capability attestation failed before launch")?;
     if fs::symlink_metadata(&profile.prefix).is_err() {
         create_app_instance(profile, engine, engine_root)?;
     }
@@ -2440,6 +2493,30 @@ mod tests {
         }
     }
 
+    fn capability_document() -> wineforge_core::EngineCapabilityDocument {
+        wineforge_core::EngineCapabilityDocument {
+            schema_version: 1,
+            kind: wineforge_core::EngineCapabilityDocumentKind::WineforgeEngineCapabilities,
+            engine_id: "example-engine-macos-x86_64".into(),
+            target: wineforge_core::EngineCapabilityTarget::MacosX86_64,
+            protocol: 1,
+            provided: vec![wineforge_core::EngineCapabilityDeclaration {
+                id: "input.scroll.precise".into(),
+                version: 1,
+                state: wineforge_core::EngineCapabilityState::Provided,
+                evidence_patches: vec!["patches/precise-scroll.patch".into()],
+                targets: vec![wineforge_core::EngineCapabilityTarget::MacosX86_64],
+                transport: Some(wineforge_core::EngineCapabilityTransport {
+                    kind: wineforge_core::EngineCapabilityTransportKind::Environment,
+                    variables: vec!["WINEFORGE_INPUT_PRECISE_SCROLLING".into()],
+                }),
+                scope: Some(wineforge_core::EngineCapabilityScope::Process),
+                privacy: None,
+                transports: Vec::new(),
+            }],
+        }
+    }
+
     #[test]
     fn winetricks_uses_the_selected_engine_tools() {
         let temp = tempdir().unwrap();
@@ -2648,6 +2725,34 @@ mod tests {
     }
 
     #[test]
+    fn engine_capability_attestation_is_exact_and_legacy_empty_is_explicit() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("engine");
+        fs::create_dir_all(root.join("share/wineforge")).unwrap();
+        let mut engine = manifest("0".repeat(64));
+
+        attest_engine_capabilities(&engine, &root).unwrap();
+        let document = capability_document();
+        fs::write(
+            root.join("share/wineforge/capabilities.json"),
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(attest_engine_capabilities(&engine, &root).is_err());
+
+        engine.capabilities = Some(document.clone());
+        attest_engine_capabilities(&engine, &root).unwrap();
+        let mut tampered = document;
+        tampered.provided[0].version = 2;
+        fs::write(
+            root.join("share/wineforge/capabilities.json"),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(attest_engine_capabilities(&engine, &root).is_err());
+    }
+
+    #[test]
     fn engine_install_verifies_digest_and_declared_binary() {
         let temp = tempdir().unwrap();
         let archive_path = temp.path().join("engine.tar.gz");
@@ -2662,11 +2767,25 @@ mod tests {
         archive
             .append_data(&mut header, "wineforge-engine/bin/wine", &payload[..])
             .unwrap();
+        let capabilities = serde_json::to_vec_pretty(&capability_document()).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(capabilities.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "wineforge-engine/share/wineforge/capabilities.json",
+                &capabilities[..],
+            )
+            .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
 
         let digest = sha256_file(&archive_path).unwrap();
         let destination = temp.path().join("installed");
-        install_engine(&archive_path, &manifest(digest), &destination).unwrap();
+        let mut engine = manifest(digest);
+        engine.capabilities = Some(capability_document());
+        install_engine(&archive_path, &engine, &destination).unwrap();
         assert!(destination.join("wineforge-engine/bin/wine").is_file());
         assert_eq!(
             read_config::<EngineManifest>(&destination.join("engine.toml"))

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,108 @@ pub struct CapabilitySet(pub BTreeMap<String, Capability>);
 #[serde(deny_unknown_fields)]
 pub struct Capability {
     pub version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCapabilityDocument {
+    pub schema_version: u32,
+    pub kind: EngineCapabilityDocumentKind,
+    pub engine_id: String,
+    pub target: EngineCapabilityTarget,
+    pub protocol: u32,
+    pub provided: Vec<EngineCapabilityDeclaration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineCapabilityDocumentKind {
+    WineforgeEngineCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineCapabilityTarget {
+    #[serde(rename = "linux-x86_64")]
+    LinuxX86_64,
+    #[serde(rename = "macos-x86_64")]
+    MacosX86_64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCapabilityDeclaration {
+    pub id: String,
+    pub version: u32,
+    pub state: EngineCapabilityState,
+    pub evidence_patches: Vec<PathBuf>,
+    pub targets: Vec<EngineCapabilityTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<EngineCapabilityTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<EngineCapabilityScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<EngineCapabilityPrivacy>,
+    #[serde(default)]
+    pub transports: Vec<EngineBridgeTransport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineCapabilityState {
+    Provided,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCapabilityTransport {
+    pub kind: EngineCapabilityTransportKind,
+    pub variables: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineCapabilityTransportKind {
+    Environment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineCapabilityScope {
+    Process,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineCapabilityPrivacy {
+    pub requires_external_window_observation: bool,
+    pub requires_accessibility: bool,
+    pub requires_screen_recording: bool,
+    pub requires_input_monitoring: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineBridgeTransport {
+    UnixSocket,
+    NamedPipe,
+}
+
+impl EngineCapabilityDocument {
+    pub fn provided_set(&self) -> CapabilitySet {
+        CapabilitySet(
+            self.provided
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        Capability {
+                            version: item.version,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

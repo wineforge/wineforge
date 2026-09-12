@@ -11,7 +11,10 @@ mod validate;
 pub use apply::{ApplyError, ApplyReceipt, apply_mapping_plan, verify_mappings};
 pub use capability::{
     Capability, CapabilityComposition, CapabilityCompositions, CapabilityInventory,
-    CapabilityProvider, CapabilityRequirement, CapabilitySet, valid_capability_name,
+    CapabilityProvider, CapabilityRequirement, CapabilitySet, EngineBridgeTransport,
+    EngineCapabilityDeclaration, EngineCapabilityDocument, EngineCapabilityDocumentKind,
+    EngineCapabilityPrivacy, EngineCapabilityScope, EngineCapabilityState, EngineCapabilityTarget,
+    EngineCapabilityTransport, EngineCapabilityTransportKind, valid_capability_name,
 };
 pub use configuration::{
     EffectiveConfiguration, KeyboardMapping, KeyboardOverride, KeyboardPreset,

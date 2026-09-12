@@ -326,21 +326,8 @@ impl Validate for EngineManifest {
         if self.license.name.trim().is_empty() {
             push(&mut errors, "license.name", "must not be blank");
         }
-        for (name, capability) in &self.capabilities.0 {
-            if !crate::valid_capability_name(name) {
-                push(
-                    &mut errors,
-                    format!("capabilities.{name}"),
-                    "invalid capability name",
-                );
-            }
-            if capability.version == 0 {
-                push(
-                    &mut errors,
-                    format!("capabilities.{name}.version"),
-                    "must be at least 1",
-                );
-            }
+        if let Some(document) = &self.capabilities {
+            validate_engine_capabilities(&mut errors, self, document);
         }
         for (name, composition) in &self.composed_capabilities {
             if !crate::valid_capability_name(name) {
@@ -362,6 +349,118 @@ impl Validate for EngineManifest {
             Ok(())
         } else {
             Err(ValidationErrors(errors))
+        }
+    }
+}
+
+fn validate_engine_capabilities(
+    errors: &mut Vec<ValidationError>,
+    manifest: &EngineManifest,
+    document: &crate::EngineCapabilityDocument,
+) {
+    if document.schema_version != 1 || document.protocol != 1 {
+        push(
+            errors,
+            "capabilities",
+            "only schema and protocol version 1 are supported",
+        );
+    }
+    if document.engine_id != manifest.id {
+        push(
+            errors,
+            "capabilities.engine_id",
+            "must match the engine manifest id",
+        );
+    }
+    let expected_target = match manifest.platform {
+        crate::Platform::MacosX86_64 => crate::EngineCapabilityTarget::MacosX86_64,
+        crate::Platform::LinuxX86_64 => crate::EngineCapabilityTarget::LinuxX86_64,
+    };
+    if document.target != expected_target {
+        push(
+            errors,
+            "capabilities.target",
+            "must match the engine manifest platform",
+        );
+    }
+    let mut ids = BTreeSet::new();
+    for (index, declaration) in document.provided.iter().enumerate() {
+        let field = format!("capabilities.provided[{index}]");
+        if !crate::valid_capability_name(&declaration.id) {
+            push(errors, format!("{field}.id"), "invalid capability name");
+        } else if !ids.insert(&declaration.id) {
+            push(errors, format!("{field}.id"), "capability is duplicated");
+        }
+        if declaration.version == 0 {
+            push(errors, format!("{field}.version"), "must be at least 1");
+        }
+        if declaration.evidence_patches.is_empty() {
+            push(
+                errors,
+                format!("{field}.evidence_patches"),
+                "must not be empty",
+            );
+        }
+        for patch in &declaration.evidence_patches {
+            if patch.is_absolute()
+                || patch.as_os_str().is_empty()
+                || patch
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                push(
+                    errors,
+                    format!("{field}.evidence_patches"),
+                    "must contain safe relative paths",
+                );
+            }
+        }
+        if !declaration.targets.contains(&expected_target) {
+            push(
+                errors,
+                format!("{field}.targets"),
+                "must include the document target",
+            );
+        }
+        if let Some(transport) = &declaration.transport {
+            if transport.variables.is_empty() {
+                push(
+                    errors,
+                    format!("{field}.transport.variables"),
+                    "must not be empty",
+                );
+            }
+            let mut variables = BTreeSet::new();
+            for variable in &transport.variables {
+                if !variables.insert(variable)
+                    || !variable.starts_with("WINEFORGE_")
+                    || !variable.bytes().all(|byte| {
+                        byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit()
+                    })
+                {
+                    push(
+                        errors,
+                        format!("{field}.transport.variables"),
+                        "contains an invalid or duplicate variable",
+                    );
+                }
+            }
+        }
+        if declaration.id == "macos.window-isolation.strict" {
+            let privacy_ok = declaration.scope == Some(crate::EngineCapabilityScope::Process)
+                && declaration.privacy.as_ref().is_some_and(|privacy| {
+                    !privacy.requires_external_window_observation
+                        && !privacy.requires_accessibility
+                        && !privacy.requires_screen_recording
+                        && !privacy.requires_input_monitoring
+                });
+            if !privacy_ok {
+                push(
+                    errors,
+                    field,
+                    "strict window isolation must declare process-local, permission-free privacy properties",
+                );
+            }
         }
     }
 }

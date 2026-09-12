@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 use wineforge_core::{
-    ApplicationProfile, ApplyError, Artifact, ArtifactSource, CurrentMapping, EngineManifest,
-    EngineSelection, Environment, HostMapping, License, MappingAccess, MappingAction, Platform,
-    Sha256Digest, Translation, Validate, apply_mapping_plan, inspect_prefix, plan_mappings,
-    verify_mappings,
+    ApplicationProfile, ApplyError, Artifact, ArtifactSource, CurrentMapping,
+    EngineCapabilityDeclaration, EngineCapabilityDocument, EngineCapabilityDocumentKind,
+    EngineCapabilityScope, EngineCapabilityState, EngineCapabilityTarget,
+    EngineCapabilityTransport, EngineCapabilityTransportKind, EngineManifest, EngineSelection,
+    Environment, HostMapping, License, MappingAccess, MappingAction, Platform, Sha256Digest,
+    Translation, Validate, apply_mapping_plan, inspect_prefix, plan_mappings, verify_mappings,
 };
 
 fn profile(prefix: &Path) -> ApplicationProfile {
@@ -167,6 +169,90 @@ fn engine_schema_and_validation_are_strict() {
     let json = serde_json::to_string(&invalid).unwrap();
     let with_extra = json.strip_suffix('}').unwrap().to_owned() + ",\"extra\":1}";
     assert!(serde_json::from_str::<EngineManifest>(&with_extra).is_err());
+}
+
+fn runtime_capabilities() -> EngineCapabilityDocument {
+    EngineCapabilityDocument {
+        schema_version: 1,
+        kind: EngineCapabilityDocumentKind::WineforgeEngineCapabilities,
+        engine_id: "verified-wine-10".into(),
+        target: EngineCapabilityTarget::MacosX86_64,
+        protocol: 1,
+        provided: vec![EngineCapabilityDeclaration {
+            id: "input.scroll.precise".into(),
+            version: 1,
+            state: EngineCapabilityState::Provided,
+            evidence_patches: vec!["patches/precise-scroll.patch".into()],
+            targets: vec![EngineCapabilityTarget::MacosX86_64],
+            transport: Some(EngineCapabilityTransport {
+                kind: EngineCapabilityTransportKind::Environment,
+                variables: vec!["WINEFORGE_INPUT_PRECISE_SCROLLING".into()],
+            }),
+            scope: Some(EngineCapabilityScope::Process),
+            privacy: None,
+            transports: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn engine_runtime_capability_document_matches_builder_wire_format() {
+    let document = runtime_capabilities();
+    let json = serde_json::to_value(&document).unwrap();
+    assert_eq!(json["kind"], "wineforge-engine-capabilities");
+    assert_eq!(json["target"], "macos-x86_64");
+    assert_eq!(json["provided"][0]["state"], "provided");
+    assert_eq!(json["provided"][0]["transport"]["kind"], "environment");
+    assert_eq!(
+        serde_json::from_value::<EngineCapabilityDocument>(json).unwrap(),
+        document
+    );
+    assert_eq!(document.provided_set().0["input.scroll.precise"].version, 1);
+}
+
+#[test]
+fn engine_runtime_capabilities_are_bound_to_manifest_identity() {
+    let mut manifest = EngineManifest {
+        schema_version: 1,
+        id: "verified-wine-10".into(),
+        platform: Platform::MacosX86_64,
+        host_architecture: "x86_64".into(),
+        translation: Translation::Rosetta2,
+        artifact: Artifact {
+            source: ArtifactSource::UserSupplied,
+            sha256: Sha256Digest("a".repeat(64)),
+        },
+        wine_binary: "bin/wine".into(),
+        environment: Environment::default(),
+        license: License {
+            name: "Example License".into(),
+            url: "https://example.invalid/license".parse().unwrap(),
+            acceptance_required: false,
+        },
+        capabilities: Some(runtime_capabilities()),
+        composed_capabilities: Default::default(),
+    };
+    manifest.validate().unwrap();
+
+    manifest.capabilities.as_mut().unwrap().engine_id = "another-engine".into();
+    assert!(
+        manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("engine_id")
+    );
+
+    let capabilities = manifest.capabilities.as_mut().unwrap();
+    capabilities.engine_id = manifest.id.clone();
+    capabilities.provided[0].evidence_patches = vec!["../outside.patch".into()];
+    assert!(
+        manifest
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("safe relative paths")
+    );
 }
 
 #[test]
