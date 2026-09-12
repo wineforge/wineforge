@@ -1358,6 +1358,8 @@ mod tests {
                 url: "https://example.invalid/license".parse().unwrap(),
                 acceptance_required: false,
             },
+            capabilities: Default::default(),
+            composed_capabilities: Default::default(),
         };
         fs::write(
             engine_root.join(".wineforge-engine.json"),
@@ -1420,6 +1422,8 @@ mod tests {
                 path: "C:\\Payload\\app.exe".into(),
                 sha256: None,
             }],
+            requirements: Default::default(),
+            configuration: Default::default(),
         };
         fs::write(&recipe_path, toml::to_string_pretty(&recipe).unwrap()).unwrap();
         let shared_directory = temp.path().join("shared");
@@ -1448,6 +1452,7 @@ mod tests {
             isolation: IsolationPolicy {
                 mode: IsolationMode::Disabled,
             },
+            configuration: Default::default(),
         };
         let cache = temp.path().join("cache");
 

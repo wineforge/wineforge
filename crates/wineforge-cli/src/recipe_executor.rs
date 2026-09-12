@@ -115,6 +115,7 @@ pub fn install(
     cache: &Path,
     accept_license: bool,
 ) -> Result<()> {
+    crate::resolve_recipe_profile(recipe, profile, engine)?;
     if recipe.license.acceptance == LicenseAcceptance::Required && !accept_license {
         bail!(
             "recipe license acceptance is required; review license.noticeUrl and pass --accept-license"
@@ -926,6 +927,7 @@ mod tests {
             engines: BTreeMap::new(),
             environment: Default::default(),
             isolation: Default::default(),
+            configuration: Default::default(),
         };
 
         copy_file(

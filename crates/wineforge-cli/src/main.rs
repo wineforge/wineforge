@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -11,13 +12,15 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wineforge_core::{
-    ApplicationProfile, CurrentMapping, EngineDistribution, EngineManifest, IsolationMode,
+    ApplicationProfile, Capability, CapabilityInventory, CapabilityProvider, CapabilityRequirement,
+    CapabilitySet, CurrentMapping, EngineDistribution, EngineManifest, IsolationMode,
     MappingAccess, MappingAction, Platform, Translation, Validate, apply_mapping_plan,
     inspect_prefix, plan_mappings,
 };
 
 mod chocolatey;
 mod download;
+mod mcp_broker;
 mod native_package;
 mod prepare;
 mod recipe;
@@ -110,6 +113,11 @@ enum Command {
         #[command(subcommand)]
         command: RecipeCommand,
     },
+    /// Run explicitly authorized, application-scoped MCP forwarding.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Install a recipe as a registry-free native operating-system package.
     Install {
         recipe: PathBuf,
@@ -172,6 +180,49 @@ enum Command {
         /// Apply mapping changes before launch. Without this flag, drift fails closed.
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Forward one authenticated Unix-socket connection to a native stdio server.
+    #[cfg(unix)]
+    ForwardUnix {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Environment variable containing the per-launch authentication token.
+        #[arg(long, default_value = "WINEFORGE_MCP_TOKEN")]
+        token_env: String,
+        /// Absolute path to the native MCP server. No shell is used.
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long = "server-arg", allow_hyphen_values = true)]
+        server_arguments: Vec<String>,
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_message_bytes: usize,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
+    },
+    /// Forward one authenticated loopback TCP connection to a native stdio server.
+    ForwardTcp {
+        #[arg(long)]
+        listen: SocketAddr,
+        /// Environment variable containing the per-launch authentication token.
+        #[arg(long, default_value = "WINEFORGE_MCP_TOKEN")]
+        token_env: String,
+        /// Absolute path to the native MCP server. No shell is used.
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long = "server-arg", allow_hyphen_values = true)]
+        server_arguments: Vec<String>,
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_message_bytes: usize,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
     },
 }
 
@@ -241,6 +292,8 @@ enum AppCommand {
 
 #[derive(Debug, Subcommand)]
 enum EngineCommand {
+    /// Print the typed capabilities advertised by an engine manifest.
+    Capabilities { manifest: PathBuf },
     /// Delete managed engine installations from a store.
     Prune {
         /// Directory whose immediate children are managed engine installations.
@@ -278,6 +331,14 @@ enum EngineCommand {
 
 #[derive(Debug, Subcommand)]
 enum RecipeCommand {
+    /// Explain layered recipe/profile configuration and verify engine capabilities.
+    Explain {
+        recipe: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        engine_manifest: PathBuf,
+    },
     /// Validate recipe TOML without downloading or executing anything.
     Validate { recipe: PathBuf },
     /// Print a validated recipe's sources, actions, and postconditions.
@@ -422,6 +483,7 @@ fn main() -> Result<()> {
                 keep_build_artifacts,
                 non_interactive,
             })?;
+            resolve_recipe_profile(&recipe, &prepared.profile, &prepared.engine)?;
             if let Some(format) = then_install {
                 install_native_package(
                     &recipe,
@@ -516,6 +578,13 @@ fn main() -> Result<()> {
             }
         },
         Command::Engine { command } => match command {
+            EngineCommand::Capabilities { manifest } => {
+                let manifest = read_engine(&manifest)?;
+                println!(
+                    "{}",
+                    toml::to_string_pretty(&capability_inventory(&manifest)?)?
+                );
+            }
             EngineCommand::Prune {
                 store,
                 id,
@@ -540,6 +609,19 @@ fn main() -> Result<()> {
             )?,
         },
         Command::Recipe { command } => match command {
+            RecipeCommand::Explain {
+                recipe: path,
+                profile,
+                engine_manifest,
+            } => {
+                let recipe = recipe::read(&path)?;
+                let profile = read_profile(&profile)?;
+                let engine = read_engine(&engine_manifest)?;
+                println!(
+                    "{}",
+                    toml::to_string_pretty(&resolve_recipe_profile(&recipe, &profile, &engine)?)?
+                );
+            }
             RecipeCommand::Validate { recipe: path } => {
                 let recipe = recipe::read(&path)?;
                 println!("valid recipe: {} {}", recipe.id, recipe.version);
@@ -601,6 +683,50 @@ fn main() -> Result<()> {
                 all,
                 yes,
             )?,
+        },
+        Command::Mcp { command } => match command {
+            #[cfg(unix)]
+            McpCommand::ForwardUnix {
+                socket,
+                token_env,
+                executable,
+                server_arguments,
+                working_directory,
+                max_message_bytes,
+                idle_timeout_seconds,
+            } => {
+                let token = mcp_token(&token_env)?;
+                let server = mcp_broker::NativeServer {
+                    executable,
+                    arguments: server_arguments,
+                    working_directory,
+                    removed_environment: vec![token_env],
+                };
+                let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
+                mcp_broker::serve_unix_once(&socket, &token, &server, &limits)?;
+            }
+            McpCommand::ForwardTcp {
+                listen,
+                token_env,
+                executable,
+                server_arguments,
+                working_directory,
+                max_message_bytes,
+                idle_timeout_seconds,
+            } => {
+                if listen.port() == 0 {
+                    bail!("--listen must specify a nonzero port");
+                }
+                let token = mcp_token(&token_env)?;
+                let server = mcp_broker::NativeServer {
+                    executable,
+                    arguments: server_arguments,
+                    working_directory,
+                    removed_environment: vec![token_env],
+                };
+                let limits = mcp_limits(max_message_bytes, idle_timeout_seconds)?;
+                mcp_broker::serve_tcp_once(listen, &token, &server, &limits)?;
+            }
         },
         Command::Install {
             recipe: recipe_path,
@@ -673,6 +799,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn mcp_token(variable: &str) -> Result<String> {
+    if variable.is_empty()
+        || !variable
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        bail!("MCP token environment variable must use uppercase ASCII, digits, and underscores");
+    }
+    std::env::var(variable)
+        .with_context(|| format!("MCP authentication token is not set in {variable}"))
+}
+
+fn mcp_limits(
+    max_message_bytes: usize,
+    idle_timeout_seconds: u64,
+) -> Result<mcp_broker::BrokerLimits> {
+    if !(256..=16 * 1024 * 1024).contains(&max_message_bytes) {
+        bail!("MCP maximum message size must be between 256 bytes and 16 MiB");
+    }
+    if !(1..=86_400).contains(&idle_timeout_seconds) {
+        bail!("MCP idle timeout must be between 1 second and 24 hours");
+    }
+    Ok(mcp_broker::BrokerLimits {
+        max_message_bytes,
+        idle_timeout: Duration::from_secs(idle_timeout_seconds),
+    })
+}
+
 fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bool) -> Result<()> {
     if !all && digests.is_empty() {
         bail!("select at least one --sha256 or pass --all");
@@ -735,6 +889,56 @@ fn prune_source_cache(cache: &Path, digests: &[String], all: bool, confirmed: bo
     Ok(())
 }
 
+fn capability_inventory(manifest: &EngineManifest) -> Result<CapabilityInventory> {
+    let runtime = CapabilitySet(BTreeMap::from([
+        ("configuration.layering".into(), Capability { version: 1 }),
+        ("mcp.broker".into(), Capability { version: 1 }),
+    ]));
+    CapabilityInventory {
+        engine: manifest.capabilities.clone(),
+        runtime,
+        composed: CapabilitySet::default(),
+    }
+    .compose(&manifest.composed_capabilities)
+    .context("engine composed capabilities cannot be satisfied")
+}
+
+fn resolve_recipe_profile(
+    recipe: &recipe::Recipe,
+    profile: &ApplicationProfile,
+    manifest: &EngineManifest,
+) -> Result<wineforge_core::EffectiveConfiguration> {
+    let effective =
+        wineforge_core::resolve_configuration(&recipe.configuration, &profile.configuration)
+            .context("recipe/profile configuration cannot be resolved")?;
+    let mut requirements = recipe.requirements.capabilities.clone();
+    if effective.keyboard_preset.is_some() || !effective.keyboard_mappings.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "input.keyboard".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Engine,
+        });
+    }
+    if !effective.scrolling_mappings.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "input.scrolling".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Engine,
+        });
+    }
+    if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.forwarding".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Composed,
+        });
+    }
+    capability_inventory(manifest)?
+        .satisfy(&requirements)
+        .context("engine/runtime capability requirements are not satisfied")?;
+    Ok(effective)
+}
+
 fn default_source_cache() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     let relative = Path::new("Library/Caches/wineforge/sources");
@@ -759,6 +963,7 @@ fn install_native_package(
     launcher_binary: Option<PathBuf>,
     accept_license: bool,
 ) -> Result<()> {
+    resolve_recipe_profile(recipe, profile, engine)?;
     let destination = destination.map_or_else(
         || native_package::default_destination(format, recipe, profile),
         Ok,
@@ -1883,6 +2088,7 @@ mod tests {
             environment: Environment::default(),
             mappings: Vec::new(),
             isolation: wineforge_core::IsolationPolicy::default(),
+            configuration: Default::default(),
         }
     }
 
@@ -1904,6 +2110,8 @@ mod tests {
                 url: "https://example.invalid/license".parse().unwrap(),
                 acceptance_required: false,
             },
+            capabilities: Default::default(),
+            composed_capabilities: Default::default(),
         }
     }
 

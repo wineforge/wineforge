@@ -64,6 +64,29 @@ attestations so independent builds can be compared. Code signing and
 notarization establish publisher identity and integrity after signing; they do
 not replace source review or sandboxing.
 
+## MCP forwarding
+
+The first-stage MCP broker is an explicit CLI primitive, not an automatic
+recipe execution mechanism. It accepts one authenticated application-scoped
+connection on either a Unix socket or loopback TCP and forwards newline-delimited
+JSON-RPC objects to one native stdio server.
+
+- Unix sockets are created with owner-only permissions and existing paths are
+  never replaced.
+- TCP listeners reject non-loopback addresses and peers.
+- The native executable and each argument are passed directly without a shell.
+- Authentication happens before the native child is started.
+- The per-launch token is read from an environment variable, is not accepted on
+  the command line, and is removed from the native child's environment.
+- Message sizes and idle time are bounded, and the native child is terminated
+  when its application connection ends.
+
+Recipe MCP endpoints remain symbolic. A future trusted local server registry
+will bind those names to executable paths; recipes must never choose arbitrary
+host commands. MCP forwarding intentionally crosses the Wine isolation boundary
+and does not itself grant filesystem or network access beyond the selected MCP
+server's own permissions.
+
 ## Chocolatey translation
 
 Wineforge does not launch Chocolatey, PowerShell, or a .NET runtime when using a
