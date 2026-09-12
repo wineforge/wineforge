@@ -1859,6 +1859,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wineforge-mcp-bridge"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

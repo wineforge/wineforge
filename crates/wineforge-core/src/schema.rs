@@ -107,8 +107,8 @@ pub struct EngineManifest {
     #[serde(default)]
     pub environment: Environment,
     pub license: License,
-    #[serde(default)]
-    pub capabilities: crate::CapabilitySet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::EngineCapabilityDocument>,
     #[serde(default)]
     pub composed_capabilities: crate::CapabilityCompositions,
 }

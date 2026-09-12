@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/wineforge-core", "crates/wineforge-cli"]
+members = [
+    "crates/wineforge-core",
+    "crates/wineforge-cli",
+    "crates/wineforge-mcp-bridge",
+]
 resolver = "2"
 
 [workspace.package]

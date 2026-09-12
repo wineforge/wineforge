@@ -13,7 +13,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(unix)]
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -80,6 +79,86 @@ pub(crate) fn serve_tcp_once(
     Ok(bound)
 }
 
+/// A loopback broker owned by one Wine application launch.
+pub(crate) struct RunningTcpBroker {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<TcpStream>>>,
+    worker: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl RunningTcpBroker {
+    pub(crate) fn start(token: String, server: NativeServer, limits: BrokerLimits) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .context("could not bind application MCP broker to loopback")?;
+        let address = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(None));
+        let worker_stop = Arc::clone(&stop);
+        let worker_active = Arc::clone(&active);
+        let worker = thread::spawn(move || {
+            loop {
+                if worker_stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        if !peer.ip().is_loopback() {
+                            continue;
+                        }
+                        stream.set_nonblocking(false)?;
+                        configure_tcp(&stream, limits.idle_timeout)?;
+                        *worker_active.lock().expect("active MCP stream lock") =
+                            Some(stream.try_clone()?);
+                        let result = forward(stream, &token, &server, &limits);
+                        worker_active.lock().expect("active MCP stream lock").take();
+                        return result;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            stop,
+            active,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn stop_and_join(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(stream) = self.active.lock().expect("active MCP stream lock").as_ref() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = TcpStream::connect(self.address);
+        match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("MCP broker worker panicked"))?,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn shutdown(mut self) -> Result<()> {
+        self.stop_and_join()
+    }
+}
+
+impl Drop for RunningTcpBroker {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn serve_unix_once(
     socket_path: &Path,
@@ -119,104 +198,6 @@ struct SocketCleanup(PathBuf);
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// A broker owned by one Wine application launch.
-#[cfg(unix)]
-pub(crate) struct RunningUnixBroker {
-    socket_path: PathBuf,
-    stop: Arc<AtomicBool>,
-    active: Arc<Mutex<Option<UnixStream>>>,
-    worker: Option<thread::JoinHandle<Result<()>>>,
-}
-
-#[cfg(unix)]
-impl RunningUnixBroker {
-    pub(crate) fn start(
-        socket_path: PathBuf,
-        token: String,
-        server: NativeServer,
-        limits: BrokerLimits,
-    ) -> Result<Self> {
-        if socket_path.exists() {
-            bail!(
-                "refusing to replace existing socket {}",
-                socket_path.display()
-            );
-        }
-        let parent = socket_path
-            .parent()
-            .context("Unix socket path must have a parent directory")?;
-        fs::create_dir_all(parent)?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("could not bind MCP socket {}", socket_path.display()))?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(Mutex::new(None));
-        let worker_stop = Arc::clone(&stop);
-        let worker_active = Arc::clone(&active);
-        let cleanup_path = socket_path.clone();
-        let worker = thread::spawn(move || {
-            let result = loop {
-                if worker_stop.load(Ordering::Acquire) {
-                    break Ok(());
-                }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        stream.set_read_timeout(Some(limits.idle_timeout))?;
-                        stream.set_write_timeout(Some(limits.idle_timeout))?;
-                        *worker_active.lock().expect("active MCP stream lock") =
-                            Some(stream.try_clone()?);
-                        let result = forward(stream, &token, &server, &limits);
-                        worker_active.lock().expect("active MCP stream lock").take();
-                        break result;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(error) => break Err(error.into()),
-                }
-            };
-            let _ = fs::remove_file(cleanup_path);
-            result
-        });
-        Ok(Self {
-            socket_path,
-            stop,
-            active,
-            worker: Some(worker),
-        })
-    }
-
-    fn stop_and_join(&mut self) -> Result<()> {
-        self.stop.store(true, Ordering::Release);
-        if let Some(stream) = self.active.lock().expect("active MCP stream lock").as_ref() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        // Wake a nonblocking listener before joining it.
-        let _ = UnixStream::connect(&self.socket_path);
-        let result = match self.worker.take() {
-            Some(worker) => worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("MCP broker worker panicked"))?,
-            None => Ok(()),
-        };
-        let _ = fs::remove_file(&self.socket_path);
-        result
-    }
-
-    pub(crate) fn shutdown(mut self) -> Result<()> {
-        self.stop_and_join()
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RunningUnixBroker {
-    fn drop(&mut self) {
-        let _ = self.stop_and_join();
     }
 }
 

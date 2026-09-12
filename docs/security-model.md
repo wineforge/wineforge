@@ -86,7 +86,10 @@ binds those names to executable paths; recipes never choose arbitrary host
 commands. Profile-requested MCP method categories must also be allowed by that
 registry and are enforced before each request reaches native stdio. The runtime
 configuration and random per-endpoint tokens are stored in an owner-only
-per-launch directory and removed when Wine exits. MCP forwarding intentionally
+per-launch directory inside the private prefix and removed when Wine exits.
+The Windows stdio bridge connects only to an IPv4 loopback listener and refuses
+non-loopback addresses. This is used instead of host Unix sockets because those
+paths are not a portable Winsock/Wine contract. MCP forwarding intentionally
 crosses the Wine isolation boundary and does not itself grant filesystem or
 network access beyond the selected MCP server's own permissions.
 

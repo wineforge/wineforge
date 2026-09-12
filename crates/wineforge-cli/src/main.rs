@@ -904,9 +904,14 @@ fn capability_inventory(manifest: &EngineManifest) -> Result<CapabilityInventory
     let runtime = CapabilitySet(BTreeMap::from([
         ("configuration.layering".into(), Capability { version: 1 }),
         ("mcp.broker".into(), Capability { version: 1 }),
+        ("mcp.bridge".into(), Capability { version: 1 }),
     ]));
     CapabilityInventory {
-        engine: manifest.capabilities.clone(),
+        engine: manifest
+            .capabilities
+            .as_ref()
+            .map(wineforge_core::EngineCapabilityDocument::provided_set)
+            .unwrap_or_default(),
         runtime,
         composed: CapabilitySet::default(),
     }
@@ -925,6 +930,11 @@ fn resolve_recipe_profile(
     let mut requirements = recipe.requirements.capabilities.clone();
     requirements.extend(effective.engine_requirements());
     if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.bridge".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Runtime,
+        });
         requirements.push(CapabilityRequirement {
             name: "mcp.forwarding".into(),
             minimum_version: 1,
@@ -1008,6 +1018,9 @@ pub(crate) fn install_engine(
     manifest: &EngineManifest,
     destination: &Path,
 ) -> Result<()> {
+    manifest
+        .validate()
+        .context("engine manifest validation failed")?;
     if destination.exists() {
         bail!("destination already exists: {}", destination.display());
     }
@@ -1043,6 +1056,10 @@ pub(crate) fn install_engine(
             "archive did not contain the declared Wine executable: {}",
             wine.display()
         );
+    }
+    if let Err(error) = attest_engine_capabilities(manifest, &engine_root) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error.context("installed engine capability attestation failed"));
     }
     let marker = ManagedEntry {
         schema_version: 1,
@@ -1454,6 +1471,44 @@ pub(crate) fn engine_wine(engine: &EngineManifest, engine_root: &Path) -> Result
     Ok(canonical_wine)
 }
 
+fn attest_engine_capabilities(engine: &EngineManifest, engine_root: &Path) -> Result<()> {
+    const MAX_CAPABILITY_DOCUMENT_BYTES: u64 = 1024 * 1024;
+    let root = resolved_engine_root(engine, engine_root)?;
+    let path = root.join("share/wineforge/capabilities.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    match (&engine.capabilities, metadata) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => bail!(
+            "engine contains capability metadata but its manifest does not: {}",
+            path.display()
+        ),
+        (Some(_), None) => bail!(
+            "engine manifest declares capabilities but installed metadata is missing: {}",
+            path.display()
+        ),
+        (Some(expected), Some(metadata)) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > MAX_CAPABILITY_DOCUMENT_BYTES
+            {
+                bail!("engine capability metadata must be a small regular file");
+            }
+            let bytes = fs::read(&path)?;
+            let actual: wineforge_core::EngineCapabilityDocument =
+                serde_json::from_slice(&bytes)
+                    .context("invalid installed engine capability metadata")?;
+            if &actual != expected {
+                bail!("installed engine capability metadata does not match its manifest");
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn shutdown_wineserver(
     profile: &ApplicationProfile,
     engine: &EngineManifest,
@@ -1544,6 +1599,8 @@ pub(crate) fn adopt_imported_instance(
     engine_root: &Path,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
+    attest_engine_capabilities(engine, engine_root)
+        .context("engine capability attestation failed before launch")?;
     sanitize_prefix(&profile.prefix)?;
     prepare_private_runtime(profile)?;
     apply_profile(profile, true)?;
@@ -1905,6 +1962,8 @@ fn run_profile(
     mcp_registry_path: Option<&Path>,
 ) -> Result<()> {
     validate_engine_selection(profile, engine)?;
+    attest_engine_capabilities(engine, engine_root)
+        .context("engine capability attestation failed before launch")?;
     if fs::symlink_metadata(&profile.prefix).is_err() {
         create_app_instance(profile, engine, engine_root)?;
     }
@@ -1934,7 +1993,18 @@ fn run_profile(
     add_resolved_runtime_environment(&mut command, profile)?;
     #[cfg(unix)]
     if let Some(runtime) = &mcp {
-        command.env("WINEFORGE_MCP_CONFIG", &runtime.config_path);
+        let bridge = install_windows_mcp_bridge(profile)?;
+        command.env("WINEFORGE_MCP_CONFIG", &runtime.windows_config_path);
+        command.env(
+            "WINEFORGE_MCP_BRIDGE",
+            r"C:\.wineforge\bin\wineforge-mcp-bridge.exe",
+        );
+        debug_assert_eq!(
+            bridge,
+            profile
+                .prefix
+                .join("drive_c/.wineforge/bin/wineforge-mcp-bridge.exe")
+        );
     }
     let launch_result = command
         .status()
@@ -1951,6 +2021,44 @@ fn run_profile(
         bail!("Wine process exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn install_windows_mcp_bridge(profile: &ApplicationProfile) -> Result<PathBuf> {
+    let current = std::env::current_exe().context("could not locate Wineforge executable")?;
+    let source = current
+        .parent()
+        .context("Wineforge executable has no parent directory")?
+        .join("wineforge-mcp-bridge.exe");
+    let metadata = fs::symlink_metadata(&source).with_context(|| {
+        format!(
+            "MCP bindings require the Windows bridge beside Wineforge: {}",
+            source.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Windows MCP bridge must be a regular, non-symlink file");
+    }
+    let destination = profile
+        .prefix
+        .join("drive_c/.wineforge/bin/wineforge-mcp-bridge.exe");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension(format!("exe.tmp-{}", std::process::id()));
+    fs::copy(&source, &temporary).with_context(|| {
+        format!(
+            "could not install Windows MCP bridge into {}",
+            destination.display()
+        )
+    })?;
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "could not commit Windows MCP bridge into {}",
+            destination.display()
+        )
+    })?;
+    Ok(destination)
 }
 
 fn add_resolved_runtime_environment(
@@ -1994,15 +2102,17 @@ struct McpRuntimeConfiguration {
 struct McpRuntimeEndpoint {
     id: String,
     transport: String,
-    address: PathBuf,
+    address: String,
     token: String,
+    max_message_bytes: usize,
+    idle_timeout_seconds: u64,
 }
 
 #[cfg(unix)]
 struct ProfileMcpRuntime {
     directory: PathBuf,
-    config_path: PathBuf,
-    brokers: Vec<mcp_broker::RunningUnixBroker>,
+    windows_config_path: String,
+    brokers: Vec<mcp_broker::RunningTcpBroker>,
 }
 
 #[cfg(unix)]
@@ -2036,7 +2146,11 @@ fn start_profile_mcp(
     profile: &ApplicationProfile,
     registry_path: Option<&Path>,
 ) -> Result<Option<ProfileMcpRuntime>> {
-    start_profile_mcp_at(profile, registry_path, &std::env::temp_dir())
+    start_profile_mcp_at(
+        profile,
+        registry_path,
+        &profile.prefix.join("drive_c/.wineforge-runtime"),
+    )
 }
 
 #[cfg(unix)]
@@ -2087,7 +2201,7 @@ fn start_profile_mcp_in(
     };
     let registry = mcp_registry::read(&registry_path)?;
     let resolved = mcp_registry::resolve(&registry, bindings, "WINEFORGE_MCP_TOKEN")?;
-    fs::create_dir(&directory)?;
+    fs::create_dir_all(&directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2097,21 +2211,20 @@ fn start_profile_mcp_in(
     let result = (|| -> Result<ProfileMcpRuntime> {
         let mut brokers = Vec::new();
         let mut endpoints = Vec::new();
-        for (index, server) in resolved.into_iter().enumerate() {
+        for server in resolved {
             let token = secure_mcp_token()?;
-            let socket = directory.join(format!("endpoint-{index}.sock"));
-            brokers.push(mcp_broker::RunningUnixBroker::start(
-                socket.clone(),
-                token.clone(),
-                server.native,
-                server.limits,
-            )?);
+            let limits = server.limits.clone();
+            let broker =
+                mcp_broker::RunningTcpBroker::start(token.clone(), server.native, server.limits)?;
             endpoints.push(McpRuntimeEndpoint {
                 id: server.endpoint,
-                transport: "unix-socket".into(),
-                address: socket,
+                transport: "tcp-loopback".into(),
+                address: broker.address().to_string(),
                 token,
+                max_message_bytes: limits.max_message_bytes,
+                idle_timeout_seconds: limits.idle_timeout.as_secs(),
             });
+            brokers.push(broker);
         }
         let config_path = directory.join("runtime.toml");
         fs::write(
@@ -2123,9 +2236,13 @@ fn start_profile_mcp_in(
         )?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        let runtime_name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("runtime directory name is not valid UTF-8")?;
         Ok(ProfileMcpRuntime {
             directory: directory.clone(),
-            config_path,
+            windows_config_path: format!(r"C:\.wineforge-runtime\{runtime_name}\runtime.toml"),
             brokers,
         })
     })();
@@ -2146,6 +2263,11 @@ fn validate_profile_runtime_capabilities(
     .context("self-contained profile configuration cannot be resolved")?;
     let mut requirements = effective.engine_requirements();
     if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.bridge".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Runtime,
+        });
         requirements.push(CapabilityRequirement {
             name: "mcp.forwarding".into(),
             minimum_version: 1,
@@ -2371,6 +2493,30 @@ mod tests {
         }
     }
 
+    fn capability_document() -> wineforge_core::EngineCapabilityDocument {
+        wineforge_core::EngineCapabilityDocument {
+            schema_version: 1,
+            kind: wineforge_core::EngineCapabilityDocumentKind::WineforgeEngineCapabilities,
+            engine_id: "example-engine-macos-x86_64".into(),
+            target: wineforge_core::EngineCapabilityTarget::MacosX86_64,
+            protocol: 1,
+            provided: vec![wineforge_core::EngineCapabilityDeclaration {
+                id: "input.scroll.precise".into(),
+                version: 1,
+                state: wineforge_core::EngineCapabilityState::Provided,
+                evidence_patches: vec!["patches/precise-scroll.patch".into()],
+                targets: vec![wineforge_core::EngineCapabilityTarget::MacosX86_64],
+                transport: Some(wineforge_core::EngineCapabilityTransport {
+                    kind: wineforge_core::EngineCapabilityTransportKind::Environment,
+                    variables: vec!["WINEFORGE_INPUT_PRECISE_SCROLLING".into()],
+                }),
+                scope: Some(wineforge_core::EngineCapabilityScope::Process),
+                privacy: None,
+                transports: Vec::new(),
+            }],
+        }
+    }
+
     #[test]
     fn winetricks_uses_the_selected_engine_tools() {
         let temp = tempdir().unwrap();
@@ -2579,6 +2725,34 @@ mod tests {
     }
 
     #[test]
+    fn engine_capability_attestation_is_exact_and_legacy_empty_is_explicit() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("engine");
+        fs::create_dir_all(root.join("share/wineforge")).unwrap();
+        let mut engine = manifest("0".repeat(64));
+
+        attest_engine_capabilities(&engine, &root).unwrap();
+        let document = capability_document();
+        fs::write(
+            root.join("share/wineforge/capabilities.json"),
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+        assert!(attest_engine_capabilities(&engine, &root).is_err());
+
+        engine.capabilities = Some(document.clone());
+        attest_engine_capabilities(&engine, &root).unwrap();
+        let mut tampered = document;
+        tampered.provided[0].version = 2;
+        fs::write(
+            root.join("share/wineforge/capabilities.json"),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(attest_engine_capabilities(&engine, &root).is_err());
+    }
+
+    #[test]
     fn engine_install_verifies_digest_and_declared_binary() {
         let temp = tempdir().unwrap();
         let archive_path = temp.path().join("engine.tar.gz");
@@ -2593,11 +2767,25 @@ mod tests {
         archive
             .append_data(&mut header, "wineforge-engine/bin/wine", &payload[..])
             .unwrap();
+        let capabilities = serde_json::to_vec_pretty(&capability_document()).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(capabilities.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "wineforge-engine/share/wineforge/capabilities.json",
+                &capabilities[..],
+            )
+            .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
 
         let digest = sha256_file(&archive_path).unwrap();
         let destination = temp.path().join("installed");
-        install_engine(&archive_path, &manifest(digest), &destination).unwrap();
+        let mut engine = manifest(digest);
+        engine.capabilities = Some(capability_document());
+        install_engine(&archive_path, &engine, &destination).unwrap();
         assert!(destination.join("wineforge-engine/bin/wine").is_file());
         assert_eq!(
             read_config::<EngineManifest>(&destination.join("engine.toml"))
@@ -2897,8 +3085,8 @@ mod tests {
     #[test]
     fn profile_binding_starts_authenticated_broker_and_cleans_up() {
         use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
         use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::net::UnixStream;
 
         let temp = tempdir().unwrap();
         let prefix = temp.path().join("prefix");
@@ -2942,10 +3130,12 @@ mod tests {
         let runtime = start_profile_mcp_in(&value, Some(&registry_path), temp.path().join("m"))
             .unwrap()
             .unwrap();
-        let config: McpRuntimeConfiguration = read_config(&runtime.config_path).unwrap();
+        let config: McpRuntimeConfiguration =
+            read_config(&runtime.directory.join("runtime.toml")).unwrap();
         assert_eq!(config.endpoints.len(), 1);
         let endpoint = &config.endpoints[0];
-        let mut stream = UnixStream::connect(&endpoint.address).unwrap();
+        assert_eq!(endpoint.transport, "tcp-loopback");
+        let mut stream = TcpStream::connect(&endpoint.address).unwrap();
         writeln!(
             stream,
             r#"{{"protocol":"wineforge-mcp-forward/1","token":"{}"}}"#,
