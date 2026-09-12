@@ -31,6 +31,13 @@ Or install a matching prebuilt release with cargo-binstall:
 cargo binstall wineforge-cli
 ```
 
+MCP-bound Windows applications additionally require
+`wineforge-mcp-bridge.exe` beside the `wineforge` executable. The complete
+GitHub release archives include that statically linked companion. A plain
+`cargo install wineforge-cli` source build cannot produce the Windows companion
+on a macOS or Linux host and therefore supports non-MCP launches only, unless
+the matching bridge is installed separately.
+
 Both commands install `wineforge` and the `wineforge-launcher` companion.
 Prebuilt archives are available for Apple Silicon and Intel macOS and x86-64
 Linux. You also need:
