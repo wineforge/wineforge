@@ -904,6 +904,7 @@ fn capability_inventory(manifest: &EngineManifest) -> Result<CapabilityInventory
     let runtime = CapabilitySet(BTreeMap::from([
         ("configuration.layering".into(), Capability { version: 1 }),
         ("mcp.broker".into(), Capability { version: 1 }),
+        ("mcp.bridge".into(), Capability { version: 1 }),
     ]));
     CapabilityInventory {
         engine: manifest.capabilities.clone(),
@@ -925,6 +926,11 @@ fn resolve_recipe_profile(
     let mut requirements = recipe.requirements.capabilities.clone();
     requirements.extend(effective.engine_requirements());
     if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.bridge".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Runtime,
+        });
         requirements.push(CapabilityRequirement {
             name: "mcp.forwarding".into(),
             minimum_version: 1,
@@ -1934,7 +1940,18 @@ fn run_profile(
     add_resolved_runtime_environment(&mut command, profile)?;
     #[cfg(unix)]
     if let Some(runtime) = &mcp {
-        command.env("WINEFORGE_MCP_CONFIG", &runtime.config_path);
+        let bridge = install_windows_mcp_bridge(profile)?;
+        command.env("WINEFORGE_MCP_CONFIG", &runtime.windows_config_path);
+        command.env(
+            "WINEFORGE_MCP_BRIDGE",
+            r"C:\.wineforge\bin\wineforge-mcp-bridge.exe",
+        );
+        debug_assert_eq!(
+            bridge,
+            profile
+                .prefix
+                .join("drive_c/.wineforge/bin/wineforge-mcp-bridge.exe")
+        );
     }
     let launch_result = command
         .status()
@@ -1951,6 +1968,44 @@ fn run_profile(
         bail!("Wine process exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn install_windows_mcp_bridge(profile: &ApplicationProfile) -> Result<PathBuf> {
+    let current = std::env::current_exe().context("could not locate Wineforge executable")?;
+    let source = current
+        .parent()
+        .context("Wineforge executable has no parent directory")?
+        .join("wineforge-mcp-bridge.exe");
+    let metadata = fs::symlink_metadata(&source).with_context(|| {
+        format!(
+            "MCP bindings require the Windows bridge beside Wineforge: {}",
+            source.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Windows MCP bridge must be a regular, non-symlink file");
+    }
+    let destination = profile
+        .prefix
+        .join("drive_c/.wineforge/bin/wineforge-mcp-bridge.exe");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension(format!("exe.tmp-{}", std::process::id()));
+    fs::copy(&source, &temporary).with_context(|| {
+        format!(
+            "could not install Windows MCP bridge into {}",
+            destination.display()
+        )
+    })?;
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "could not commit Windows MCP bridge into {}",
+            destination.display()
+        )
+    })?;
+    Ok(destination)
 }
 
 fn add_resolved_runtime_environment(
@@ -1994,15 +2049,17 @@ struct McpRuntimeConfiguration {
 struct McpRuntimeEndpoint {
     id: String,
     transport: String,
-    address: PathBuf,
+    address: String,
     token: String,
+    max_message_bytes: usize,
+    idle_timeout_seconds: u64,
 }
 
 #[cfg(unix)]
 struct ProfileMcpRuntime {
     directory: PathBuf,
-    config_path: PathBuf,
-    brokers: Vec<mcp_broker::RunningUnixBroker>,
+    windows_config_path: String,
+    brokers: Vec<mcp_broker::RunningTcpBroker>,
 }
 
 #[cfg(unix)]
@@ -2036,7 +2093,11 @@ fn start_profile_mcp(
     profile: &ApplicationProfile,
     registry_path: Option<&Path>,
 ) -> Result<Option<ProfileMcpRuntime>> {
-    start_profile_mcp_at(profile, registry_path, &std::env::temp_dir())
+    start_profile_mcp_at(
+        profile,
+        registry_path,
+        &profile.prefix.join("drive_c/.wineforge-runtime"),
+    )
 }
 
 #[cfg(unix)]
@@ -2087,7 +2148,7 @@ fn start_profile_mcp_in(
     };
     let registry = mcp_registry::read(&registry_path)?;
     let resolved = mcp_registry::resolve(&registry, bindings, "WINEFORGE_MCP_TOKEN")?;
-    fs::create_dir(&directory)?;
+    fs::create_dir_all(&directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2097,21 +2158,20 @@ fn start_profile_mcp_in(
     let result = (|| -> Result<ProfileMcpRuntime> {
         let mut brokers = Vec::new();
         let mut endpoints = Vec::new();
-        for (index, server) in resolved.into_iter().enumerate() {
+        for server in resolved {
             let token = secure_mcp_token()?;
-            let socket = directory.join(format!("endpoint-{index}.sock"));
-            brokers.push(mcp_broker::RunningUnixBroker::start(
-                socket.clone(),
-                token.clone(),
-                server.native,
-                server.limits,
-            )?);
+            let limits = server.limits.clone();
+            let broker =
+                mcp_broker::RunningTcpBroker::start(token.clone(), server.native, server.limits)?;
             endpoints.push(McpRuntimeEndpoint {
                 id: server.endpoint,
-                transport: "unix-socket".into(),
-                address: socket,
+                transport: "tcp-loopback".into(),
+                address: broker.address().to_string(),
                 token,
+                max_message_bytes: limits.max_message_bytes,
+                idle_timeout_seconds: limits.idle_timeout.as_secs(),
             });
+            brokers.push(broker);
         }
         let config_path = directory.join("runtime.toml");
         fs::write(
@@ -2123,9 +2183,13 @@ fn start_profile_mcp_in(
         )?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+        let runtime_name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("runtime directory name is not valid UTF-8")?;
         Ok(ProfileMcpRuntime {
             directory: directory.clone(),
-            config_path,
+            windows_config_path: format!(r"C:\.wineforge-runtime\{runtime_name}\runtime.toml"),
             brokers,
         })
     })();
@@ -2146,6 +2210,11 @@ fn validate_profile_runtime_capabilities(
     .context("self-contained profile configuration cannot be resolved")?;
     let mut requirements = effective.engine_requirements();
     if !effective.mcp_endpoints.is_empty() {
+        requirements.push(CapabilityRequirement {
+            name: "mcp.bridge".into(),
+            minimum_version: 1,
+            provider: CapabilityProvider::Runtime,
+        });
         requirements.push(CapabilityRequirement {
             name: "mcp.forwarding".into(),
             minimum_version: 1,
@@ -2897,8 +2966,8 @@ mod tests {
     #[test]
     fn profile_binding_starts_authenticated_broker_and_cleans_up() {
         use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
         use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::net::UnixStream;
 
         let temp = tempdir().unwrap();
         let prefix = temp.path().join("prefix");
@@ -2942,10 +3011,12 @@ mod tests {
         let runtime = start_profile_mcp_in(&value, Some(&registry_path), temp.path().join("m"))
             .unwrap()
             .unwrap();
-        let config: McpRuntimeConfiguration = read_config(&runtime.config_path).unwrap();
+        let config: McpRuntimeConfiguration =
+            read_config(&runtime.directory.join("runtime.toml")).unwrap();
         assert_eq!(config.endpoints.len(), 1);
         let endpoint = &config.endpoints[0];
-        let mut stream = UnixStream::connect(&endpoint.address).unwrap();
+        assert_eq!(endpoint.transport, "tcp-loopback");
+        let mut stream = TcpStream::connect(&endpoint.address).unwrap();
         writeln!(
             stream,
             r#"{{"protocol":"wineforge-mcp-forward/1","token":"{}"}}"#,
